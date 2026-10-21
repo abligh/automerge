@@ -303,3 +303,29 @@ fn text_encodings_other_than_the_default_load() {
         assert_same(&doc, &reference);
     }
 }
+
+/// Rolling back a root streamed into an empty document leaves it empty,
+/// and it takes the same root again as a new document does.
+#[test]
+fn a_rolled_back_root_leaves_the_document_empty() {
+    let map =
+        hydrate_map! { "a" => 1_i64, "t" => hydrate_text!("xy"), "l" => hydrate_list![1_i64] };
+    let mut doc = Automerge::new().with_actor(actor());
+    let mut tx = doc.transaction();
+    tx.init_root_from_hydrate(&map).unwrap();
+    tx.put(ROOT, "after", 2_i64).unwrap();
+    assert_eq!(tx.rollback(), 7);
+    assert_eq!(doc.keys(ROOT).count(), 0);
+    assert!(doc.get_heads().is_empty());
+    let mut tx = doc.transaction();
+    tx.init_root_from_hydrate(&map).unwrap();
+    tx.commit();
+    let mut fresh = Automerge::new().with_actor(actor());
+    let mut tx = fresh.transaction();
+    tx.init_root_from_hydrate(&map).unwrap();
+    tx.commit();
+    assert_eq!(doc.save(), fresh.save());
+    let mut reference = Automerge::new().with_actor(actor());
+    reference.apply_changes(doc.get_changes(&[])).unwrap();
+    assert_same(&doc, &reference);
+}

@@ -89,11 +89,16 @@ where
     T: AsChangeOp,
     G: GetHash,
 {
-    let num_ops = ops.len();
+    let held = encoded.as_ref().filter(|e| e.held).map_or(0, |e| e.ops);
+    let num_ops = held + ops.len();
 
     let actor = mapper.actors[meta.actor].clone();
 
-    let start_op = ops.first().map(T::op_id_ctr).unwrap_or(meta.max_op + 1);
+    let start_op = if held > 0 {
+        meta.start_op
+    } else {
+        ops.first().map(T::op_id_ctr).unwrap_or(meta.max_op + 1)
+    };
 
     let (col_data, ops_meta) = match encoded.and_then(|e| e.extend(ops, meta.actor, mapper)) {
         Some((data, cols)) => (data, cols.into()),
@@ -418,6 +423,9 @@ pub(crate) struct EncodedOps {
     mapping: Vec<Option<ActorIdx>>,
     pub(crate) data: Vec<u8>,
     pub(crate) cols: ChangeOpsColumns,
+    /// Whether the transaction holds these ops no longer: then the ops
+    /// a commit passes are only the ones after them.
+    pub(crate) held: bool,
 }
 
 impl std::fmt::Debug for EncodedOps {
@@ -446,6 +454,29 @@ impl EncodedOps {
             mapping: mapper.mapping,
             data,
             cols,
+            held: false,
+        }
+    }
+
+    /// `ops` ops by `change_actor` alone, naming no predecessor, already
+    /// encoded as `cols` in `data`, which the transaction does not hold.
+    pub(crate) fn held(
+        ops: usize,
+        change_actor: usize,
+        actors: &[ActorId],
+        data: Vec<u8>,
+        cols: ChangeOpsColumns,
+    ) -> EncodedOps {
+        let mut mapper = ActorMapper::new(actors);
+        mapper.reset();
+        mapper.build_mapping(Some(change_actor));
+        EncodedOps {
+            ops,
+            preds: 0,
+            mapping: mapper.mapping,
+            data,
+            cols,
+            held: true,
         }
     }
 
@@ -460,14 +491,22 @@ impl EncodedOps {
         change_actor: usize,
         mapper: &mut ActorMapper<'_>,
     ) -> Option<(Vec<u8>, ChangeOpsColumns)> {
-        if ops.len() < self.ops || ops.is_empty() {
-            return None;
+        let tail = if self.held {
+            ops
+        } else {
+            if ops.len() < self.ops || ops.is_empty() {
+                return None;
+            }
+            &ops[self.ops..]
+        };
+        if self.held && tail.is_empty() {
+            return Some((self.data, self.cols));
         }
-        mapper.remap_actors(ops, change_actor);
+        mapper.remap_actors(if self.held { tail } else { ops }, change_actor);
         if mapper.mapping != self.mapping {
+            assert!(!self.held, "held ops cannot be encoded again");
             return None;
         }
-        let tail = &ops[self.ops..];
         if tail.is_empty() {
             return Some((self.data, self.cols));
         }
