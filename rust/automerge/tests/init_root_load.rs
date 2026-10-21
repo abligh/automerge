@@ -278,6 +278,34 @@ fn varied_documents_load_as_they_splice() {
     }
 }
 
+/// A root large enough that each column the stream hands over as slabs
+/// (keys, actions, value metadata) spans many of them, with runs and
+/// literals crossing their seams (galatea issue 2906).
+#[test]
+fn a_root_of_many_slabs_loads_as_it_splices() {
+    let mut rng = Lcg(2906);
+    let mut root = std::collections::HashMap::new();
+    for n in 0..5_000 {
+        // Runs of one key length and of one value, among literals.
+        let key = if n % 7 < 3 {
+            format!("k{:05}", n)
+        } else {
+            format!("key-{n}")
+        };
+        let value = if n % 11 < 4 {
+            hydrate::Value::from(ScalarValue::Str("same".into()))
+        } else if n % 97 == 0 {
+            value(&mut rng, 2)
+        } else {
+            scalar(&mut rng)
+        };
+        root.insert(key, value);
+    }
+    let root = hydrate::Map::from(root);
+    check(&root, None);
+    check(&root, Some(7));
+}
+
 #[test]
 fn an_empty_root_commits_nothing() {
     let mut doc = Automerge::new().with_actor(actor());

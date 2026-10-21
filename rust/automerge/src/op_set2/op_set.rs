@@ -1845,10 +1845,10 @@ impl<'h> RootStream<'h> {
             obj_ctr: Default::default(),
             key_actor: Default::default(),
             key_ctr: Default::default(),
-            key_str: Default::default(),
+            key_str: hexane::Encoder::<Option<String>>::default().with_segments(),
             insert: Default::default(),
-            action: Default::default(),
-            value_meta: Default::default(),
+            action: hexane::Encoder::<Action>::default().with_segments(),
+            value_meta: hexane::Encoder::<super::meta::ValueMeta>::default().with_segments(),
             value: Vec::new(),
             pred_count: Default::default(),
             expand: Default::default(),
@@ -1923,10 +1923,20 @@ impl OpSet {
         let obj_ctr = stream.obj_ctr.save_to_unless(d, None);
         let key_actor = stream.key_actor.save_to_unless(d, None);
         let key_ctr = stream.key_ctr.save_to_unless(d, None);
-        let key_str = stream.key_str.save_to_unless(d, None);
+        // These three become the op set's columns from their slabs, and
+        // the change's bytes are saved from those columns, so neither
+        // side decodes them (galatea issue 2906).
+        let built = super::columns::Built {
+            key_str: Some(stream.key_str.into_column()),
+            action: Some(stream.action.into_column()),
+            value_meta: Some(hexane::PrefixColumn::from_column(
+                stream.value_meta.into_column(),
+            )),
+        };
+        let key_str = built.key_str.as_ref().unwrap().save_to_unless(d, None);
         let insert = stream.insert.save_to(d);
-        let action = stream.action.save_to(d);
-        let value_meta = stream.value_meta.save_to(d);
+        let action = built.action.as_ref().unwrap().save_to(d);
+        let value_meta = built.value_meta.as_ref().unwrap().save_to(d);
         let start = d.len();
         d.extend_from_slice(&stream.value);
         let value = start..d.len();
@@ -1975,7 +1985,7 @@ impl OpSet {
             (EXPAND_COL_SPEC, cols.expand.clone()),
             (MARK_NAME_COL_SPEC, cols.mark_name.clone()),
         ]);
-        self.cols = Columns::load(map, &data, &self.actors)
+        self.cols = Columns::load_with_built(map, &data, &self.actors, built)
             .expect("columns load from the bytes just encoded");
         data.truncate(change_len);
         let mut obj_info = ObjIndex::default();
