@@ -313,12 +313,12 @@ impl RawColumn {
         // non-empty before this splice and is untouched by it. Scanning
         // just the range keeps a splice from walking every slab.
         let slabs_before_empty_cleanup = self.slabs.len();
+        let mut range = range;
         let mut i = range.start;
-        let mut end = range.end.min(self.slabs.len());
-        while i < end {
+        while i < range.end.min(self.slabs.len()) {
             if self.slabs[i].data.is_empty() {
                 self.slabs.remove(i);
-                end -= 1;
+                range.end -= 1;
             } else {
                 i += 1;
             }
@@ -328,19 +328,20 @@ impl RawColumn {
 
         // Update the index: one slab's new length when that is all that
         // changed, else the range's slabs in place of the ones they
-        // replaced. Nothing before the merged range changed (its left
-        // merges only ever pull its start down), so the replaced slabs
-        // are the ones that stood at the range's start, as many as the
-        // count says.
+        // replaced. Nothing before the range changed (its left merges
+        // only ever pull its start down, and every removal above was
+        // inside it or past it), so the replaced slabs are the ones that
+        // stood at the range's start, as many as the count says: the
+        // range's slabs, plus one for each slab the splice removed, less
+        // one for each it added.
+        debug_assert!(range.start <= self.slabs.len());
+        debug_assert!(range.end <= self.slabs.len());
         if !removed_empty_slabs && self.slabs.len() == old_slab_count && range.len() == 1 {
             let new_weight = self.slabs[range.start].data.len();
             if new_weight != old_weight {
                 self.index.update_slab(range.start, new_weight);
             }
         } else {
-            // A cascading delete can have dropped slabs past the range's
-            // end, and the empty-slab cleanup ones inside it.
-            let range = range.start..range.end.min(self.slabs.len());
             let replaced = range.len() + old_slab_count - self.slabs.len();
             let lengths: Vec<usize> = self.slabs[range.clone()]
                 .iter()
@@ -350,6 +351,7 @@ impl RawColumn {
                 .splice(range.start..range.start + replaced, lengths);
         }
         debug_assert_eq!(self.index.len(), self.slabs.len());
+        debug_assert_eq!(self.index.items_before(self.index.len()), self.total_len);
 
         Ok(())
     }
