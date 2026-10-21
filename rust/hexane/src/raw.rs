@@ -15,8 +15,8 @@
 //! is what makes the zero-copy [`RawColumn::get`] API safe.
 
 use crate::column::{
-    bit_point_update, find_slab_bit, normalize_splices, rebuild_bit, splice_bytes,
-    try_merge_range_skeleton, Splice,
+    bit_point_update, find_slab_bit, normalize_splices, rebuild_bit, rebuild_bit_from,
+    splice_bytes, try_merge_range_skeleton, Splice,
 };
 use crate::PackError;
 use std::ops::{Deref, Range};
@@ -306,8 +306,21 @@ impl RawColumn {
         // removed again. Empty slabs have zero weight in the BIT but are not
         // transparent to sequential readers, so drop them before rebuilding
         // the index.
+        // Only the rebuilt range can hold one: every other slab was
+        // non-empty before this splice and is untouched by it. Scanning
+        // just the range keeps a splice from walking every slab.
         let slabs_before_empty_cleanup = self.slabs.len();
-        self.slabs.retain(|slab| !slab.data.is_empty());
+        let mut i = range.start;
+        let mut end = range.end.min(self.slabs.len());
+        while i < end {
+            if self.slabs[i].data.is_empty() {
+                self.slabs.remove(i);
+                end -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        debug_assert!(self.slabs.iter().all(|slab| !slab.data.is_empty()));
         let removed_empty_slabs = self.slabs.len() != slabs_before_empty_cleanup;
 
         // Update BIT: point update if exactly one slab's weight changed,
@@ -316,7 +329,10 @@ impl RawColumn {
             let new_weight = self.slabs[range.start].data.len();
             bit_point_update(&mut self.bit, range.start, old_weight, new_weight);
         } else {
-            self.bit = rebuild_bit(&self.slabs, |s| s.data.len());
+            // Nothing before the merged range changed: its left merges
+            // only ever pull its start down.
+            rebuild_bit_from(&mut self.bit, &self.slabs, range.start, |s| s.data.len());
+            debug_assert_eq!(self.bit, rebuild_bit(&self.slabs, |s| s.data.len()));
         }
 
         Ok(())
@@ -1042,6 +1058,49 @@ mod tests {
         );
         assert!(col.slabs.iter().all(|s| !s.data.is_empty()), "empty slab");
         assert_eq!(col.bit, rebuild_bit(&col.slabs, |s| s.data.len()));
+    }
+
+    /// Splices scattered over a loaded column, in no order and mixing
+    /// inserts, deletes and replaces, as automerge's local ops land: each
+    /// leaves the bytes as a plain vector given the same splices, no
+    /// empty slab, and the Fenwick tree as a full rebuild makes it. The
+    /// tree is rebuilt in place from the splice's range and only that
+    /// range is scanned for empties, so this pins both against every
+    /// split, merge and cascading delete the splices make.
+    #[test]
+    fn scattered_splices_keep_the_tree_and_no_empty_slab() {
+        let loaded: Vec<u8> = (0..1u32 << 16).map(|i| (i % 251) as u8).collect();
+        let mut col = RawColumn::load_with_max_segments(&loaded, 64).unwrap();
+        let mut model = loaded;
+        let mut seed = 0x2667_u64;
+        let mut next = |below: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % below.max(1)
+        };
+        for k in 0..2_000usize {
+            let at = next(model.len() + 1);
+            let del = match k % 4 {
+                0 => 0,
+                1 => next(4).min(model.len() - at),
+                _ => next(200).min(model.len() - at),
+            };
+            let bytes = vec![b'a' + (k % 26) as u8; next(3) * (1 + k % 90)];
+            col.splice_slice(at, del, &bytes);
+            model.splice(at..at + del, bytes.iter().copied());
+            assert!(
+                col.slabs.iter().all(|s| !s.data.is_empty()),
+                "empty slab at {k}"
+            );
+            assert_eq!(
+                col.bit,
+                rebuild_bit(&col.slabs, |s| s.data.len()),
+                "tree at {k}"
+            );
+        }
+        drive(&col, &model);
+        assert_eq!(col.save(), model);
     }
 
     /// A shared slab that a merge or a fitting splice writes to becomes

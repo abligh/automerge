@@ -161,6 +161,46 @@ pub(crate) fn rebuild_bit<S, W: SlabWeight>(slabs: &[S], weight: impl Fn(&S) -> 
     bit
 }
 
+/// Rebuild, in place, the BIT nodes of `bit` that cover any slab from
+/// index `from` on, after the slabs from `from` on changed in number or
+/// weight and the ones before it did not. O(S - from + log S), with no
+/// allocation unless the slab count grew.
+///
+/// Node `i` (1-indexed) covers slabs `i - lowbit(i) .. i`, so the nodes
+/// up to `from` cover only unchanged slabs and keep their sums. Of those,
+/// the ones whose parent lies past `from` are exactly the nodes a prefix
+/// query of `from` visits, and they are pushed up again first; the
+/// nodes past `from` are then rebuilt as [`rebuild_bit`] builds them.
+pub(crate) fn rebuild_bit_from<S, W: SlabWeight>(
+    bit: &mut Vec<W>,
+    slabs: &[S],
+    from: usize,
+    weight: impl Fn(&S) -> W,
+) {
+    let n = slabs.len();
+    let from = from.min(n);
+    bit.resize(n + 1, W::default());
+    for i in from + 1..=n {
+        bit[i] = weight(&slabs[i - 1]);
+    }
+    let mut j = from;
+    while j > 0 {
+        let parent = j + (j & j.wrapping_neg());
+        if parent <= n {
+            let child = bit[j].clone();
+            bit[parent] += child;
+        }
+        j -= j & j.wrapping_neg();
+    }
+    for i in from + 1..=n {
+        let parent = i + (i & i.wrapping_neg());
+        if parent <= n {
+            let child = bit[i].clone();
+            bit[parent] += child;
+        }
+    }
+}
+
 /// Update the BIT at slab index `si` after a weight change. O(log S).
 ///
 /// Subtracts the old weight and adds the new weight at every ancestor node.
@@ -2036,6 +2076,34 @@ mod tests {
     use super::*;
     use crate::column::Column;
     use crate::index::BitIndex;
+
+    /// Rebuilding the tree in place from any slab on gives the tree a
+    /// full rebuild does, whether the slabs after it grew, shrank or
+    /// changed in number, and with the old tree's vector longer or
+    /// shorter than the new one.
+    #[test]
+    fn rebuilding_the_tree_from_a_slab_on_matches_a_full_rebuild() {
+        let weights = |n: usize, salt: usize| -> Vec<usize> {
+            (0..n).map(|i| 1 + (i * 7 + salt * 13) % 23).collect()
+        };
+        for old_n in 0..40 {
+            let old = weights(old_n, 1);
+            for new_n in [old_n.saturating_sub(3), old_n, old_n + 1, old_n + 5] {
+                for from in 0..=old_n.min(new_n) {
+                    // The slabs before `from` are unchanged; the rest differ.
+                    let mut new = old[..from].to_vec();
+                    new.extend(weights(new_n - from, 2 + from));
+                    let mut bit = rebuild_bit(&old, |w| *w);
+                    rebuild_bit_from(&mut bit, &new, from, |w| *w);
+                    assert_eq!(
+                        bit,
+                        rebuild_bit(&new, |w| *w),
+                        "{old_n} slabs to {new_n}, from {from}"
+                    );
+                }
+            }
+        }
+    }
 
     fn parity_column<T>(values: Vec<T>)
     where
