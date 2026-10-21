@@ -15,6 +15,7 @@ use crate::AutomergeError;
 
 use super::op::{Op, OpLike, SuccCursors, SuccInsert, TxOp};
 
+use super::change::EncodedOps;
 use super::columns::Columns;
 
 use super::types::{Action, ActorIdx, KeyRef, MarkData, OpType, ScalarValue};
@@ -211,6 +212,83 @@ impl OpSet {
         }
         assert_eq!(first_top, last_vis);
         true
+    }
+
+    /// Fills this op set, which must be empty, with `ops`, whose change
+    /// columns `encoded` holds: the columns are loaded from those bytes
+    /// rather than spliced op by op, and the indexes are built straight
+    /// from `ops`. The op set is then the one splicing `ops` in gives.
+    ///
+    /// `ops` must be in the op set's order (objects by id, map keys in
+    /// order, sequence elements in sequence order), all by `actor`, and
+    /// overwrite nothing, so no op has a successor: as a hydrate written
+    /// breadth first into an empty document gives them.
+    pub(crate) fn load_encoded(
+        &mut self,
+        ops: &[TxOp],
+        encoded: &mut EncodedOps,
+        actor: usize,
+    ) -> Result<(), PackError> {
+        use super::columns::ids::*;
+        use hexane::EncoderApi;
+        assert_eq!(self.len(), 0, "load_encoded fills an empty op set");
+        assert_eq!(encoded.ops, ops.len());
+        let n = ops.len();
+        let change_len = encoded.data.len();
+        let data = &mut encoded.data;
+        // The op set's columns the change lacks: ids and successors.
+        let id_actor = hexane::Encoder::<ActorIdx>::encode_to(
+            data,
+            std::iter::repeat_n(ActorIdx::from(actor), n),
+        );
+        let id_ctr = hexane::DeltaEncoder::<i64>::encode_to(data, ops.iter().map(TxOp::id_ctr));
+        let succ_count = hexane::Encoder::<u32>::encode_to(data, std::iter::repeat_n(0u32, n));
+        let cols = &encoded.cols;
+        let map = std::collections::BTreeMap::from([
+            (ID_ACTOR_COL_SPEC, id_actor),
+            (ID_COUNTER_COL_SPEC, id_ctr),
+            (OBJ_ID_ACTOR_COL_SPEC, cols.obj_actor.clone()),
+            (OBJ_ID_COUNTER_COL_SPEC, cols.obj_ctr.clone()),
+            (KEY_ACTOR_COL_SPEC, cols.key_actor.clone()),
+            (KEY_COUNTER_COL_SPEC, cols.key_ctr.clone()),
+            (KEY_STR_COL_SPEC, cols.key_str.clone()),
+            (INSERT_COL_SPEC, cols.insert.clone()),
+            (ACTION_COL_SPEC, cols.action.clone()),
+            (VALUE_META_COL_SPEC, cols.value_meta.clone()),
+            (VALUE_COL_SPEC, cols.value.clone()),
+            (SUCC_COUNT_COL_SPEC, succ_count),
+            (EXPAND_COL_SPEC, cols.expand.clone()),
+            (MARK_NAME_COL_SPEC, cols.mark_name.clone()),
+        ]);
+        let loaded = Columns::load(map, data, &self.actors);
+        data.truncate(change_len);
+        self.cols = loaded?;
+        let enc = self.text_encoding;
+        let text = hexane::PrefixColumn::from_values(
+            ops.iter()
+                .map(|op| TxOp::top(op).then(|| TxOp::width(op, SequenceType::Text, enc) as u32))
+                .collect(),
+        );
+        let top = hexane::PrefixColumn::from_values(ops.iter().map(TxOp::top).collect());
+        let visible = hexane::Column::from_values(ops.iter().map(TxOp::visible).collect());
+        let inc = hexane::Column::from_values(ops.iter().flat_map(TxOp::succ_inc).collect());
+        let mut mark = MarkIndexColumn::new();
+        mark.extend(0, ops.iter().map(TxOp::mark_index).collect());
+        let mut obj_info = ObjIndex::default();
+        for op in ops {
+            if let Some(info) = op.obj_info() {
+                obj_info.insert(op.id(), info);
+            }
+        }
+        self.set_indexes(Indexes {
+            text,
+            top,
+            visible,
+            inc,
+            mark,
+            obj_info,
+        });
+        Ok(())
     }
 
     pub(crate) fn set_indexes(&mut self, indexes: Indexes) {

@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::author::Author;
 use crate::exid::ExId;
 use crate::marks::{ExpandMark, Mark, MarkSet};
-use crate::op_set2::change::build_change;
+use crate::op_set2::change::{build_change, build_change_encoded, EncodedOps};
 use crate::op_set2::{Op, OpSet, PropRef, SuccInsert, TxOp};
 use crate::patches::PatchLog;
 use crate::types::{
@@ -36,6 +36,9 @@ pub(crate) struct TransactionInner {
     author: Option<Author<'static>>,
     /// Ranges of `pending` that landed together as a `batch_write`.
     batches: Vec<Range<usize>>,
+    /// The change columns of `pending`'s first ops, where a batch into
+    /// an empty document encoded them, for the commit to reuse.
+    encoded: Option<EncodedOps>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +97,7 @@ impl TransactionInner {
             scope,
             author,
             batches: vec![],
+            encoded: None,
         }
     }
 
@@ -209,7 +213,12 @@ impl TransactionInner {
             .filter_map(|hash| Some(change_graph.hash_to_index(hash)? as u64))
             .collect();
         let meta = self.change_meta(deps_index);
-        let stored = build_change(&self.pending, &meta, change_graph, &op_set.actors);
+        let stored = match self.encoded.take() {
+            Some(encoded) => {
+                build_change_encoded(&self.pending, &meta, change_graph, &op_set.actors, encoded)
+            }
+            None => build_change(&self.pending, &meta, change_graph, &op_set.actors),
+        };
         Change::new(stored)
     }
 
@@ -1588,6 +1597,17 @@ impl TransactionInner {
 
         batch_bfs(&mut batch, &mut queue)?;
 
+        // Into an empty document, breadth first, the batch's ops are in
+        // the op set's order and overwrite nothing, so the op set can be
+        // loaded from their change columns, which the commit reuses.
+        if insert_pos == 0 && batch.pending_start == 0 {
+            let mut encoded = EncodedOps::new(&self.pending, self.actor, &doc.ops().actors);
+            doc.ops_mut()
+                .load_encoded(&self.pending, &mut encoded, self.actor)
+                .expect("columns load from the bytes just encoded");
+            self.encoded = Some(encoded);
+            return Ok(());
+        }
         batch.finish();
         Ok(())
     }
