@@ -57,14 +57,57 @@ where
     T: AsChangeOp,
     G: GetHash,
 {
-    let num_ops = ops.len();
-    let mut col_data = Vec::new();
+    build_change_with(ops, meta, graph, mapper, None)
+}
+
+/// [`build_change`] for `ops` whose first `encoded.ops` are already
+/// encoded in `encoded`: only the ops after those are encoded, and the
+/// change's bytes are the ones [`build_change`] gives.
+pub(crate) fn build_change_encoded<T, G>(
+    ops: &[T],
+    meta: &BuildChangeMetadata<'_>,
+    graph: &G,
+    actors: &[ActorId],
+    encoded: EncodedOps,
+) -> Change<'static, Verified>
+where
+    T: AsChangeOp,
+    G: GetHash,
+{
+    let mut mapper = ActorMapper::new(actors);
+    build_change_with(ops, meta, graph, &mut mapper, Some(encoded))
+}
+
+fn build_change_with<T, G>(
+    ops: &[T],
+    meta: &BuildChangeMetadata<'_>,
+    graph: &G,
+    mapper: &mut ActorMapper<'_>,
+    encoded: Option<EncodedOps>,
+) -> Change<'static, Verified>
+where
+    T: AsChangeOp,
+    G: GetHash,
+{
+    let held = encoded.as_ref().filter(|e| e.held).map_or(0, |e| e.ops);
+    let num_ops = held + ops.len();
 
     let actor = mapper.actors[meta.actor].clone();
 
-    let start_op = ops.first().map(T::op_id_ctr).unwrap_or(meta.max_op + 1);
+    let start_op = if held > 0 {
+        meta.start_op
+    } else {
+        ops.first().map(T::op_id_ctr).unwrap_or(meta.max_op + 1)
+    };
 
-    let ops_meta = write_change_ops(ops, meta.actor, &mut col_data, mapper);
+    let (col_data, ops_meta) = match encoded.and_then(|e| e.extend(ops, meta.actor, mapper)) {
+        Some((data, cols)) => (data, cols.into()),
+        None => {
+            let mut col_data = Vec::new();
+            let ops_meta = write_change_ops(ops, meta.actor, &mut col_data, mapper);
+            (col_data, ops_meta)
+        }
+    };
 
     let other_actors: Vec<_> = mapper.iter().collect();
 
@@ -146,7 +189,7 @@ impl Ord for OpBuilder<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct ChangeOpsColumns {
     pub(crate) obj_actor: Range<usize>,
     pub(crate) obj_ctr: Range<usize>,
@@ -196,10 +239,22 @@ where
     }
 
     mapper.remap_actors(ops, change_actor);
+    encode_change_ops(ops, data, &mapper.mapping).into()
+}
 
+/// `ops`' change columns, appended to `data`, their actors numbered by
+/// `mapping` (an [`ActorMapper`]'s after `remap_actors` over a set of
+/// ops holding these).
+pub(crate) fn encode_change_ops<T>(
+    ops: &[T],
+    data: &mut Vec<u8>,
+    mapping: &[Option<ActorIdx>],
+) -> ChangeOpsColumns
+where
+    T: AsChangeOp,
+{
     use hexane::EncoderApi;
 
-    let mapping = &mapper.mapping;
     let remap_opt_actor = |actor: Option<ActorIdx>| actor.map(|a| mapping[usize::from(a)].unwrap());
     let remap_actor = |a: ActorIdx| mapping[usize::from(a)].unwrap();
 
@@ -244,7 +299,7 @@ where
         None,
     );
 
-    let cols = ChangeOpsColumns {
+    ChangeOpsColumns {
         obj_actor,
         obj_ctr,
         key_actor,
@@ -259,9 +314,7 @@ where
         pred_ctr,
         expand,
         mark_name,
-    };
-
-    cols.into()
+    }
 }
 
 // The many small mallocs in the remap_actors
@@ -350,5 +403,192 @@ impl<'a> ActorMapper<'a> {
         }
 
         self.build_mapping(Some(change_actor));
+    }
+}
+
+/// The change columns of a transaction's first `ops` ops, encoded once
+/// so that committing the transaction need not encode them again.
+///
+/// The ops' change fields never change once they are pending (a
+/// `batch_write` moves only their positions and undo links), so these
+/// bytes stay theirs until the commit.
+#[derive(Clone)]
+pub(crate) struct EncodedOps {
+    /// How many of the transaction's ops are encoded.
+    pub(crate) ops: usize,
+    /// How many predecessors those ops name, the length of the
+    /// `pred_actor` and `pred_ctr` columns.
+    preds: usize,
+    /// The actor numbering the columns were written with.
+    mapping: Vec<Option<ActorIdx>>,
+    pub(crate) data: Vec<u8>,
+    pub(crate) cols: ChangeOpsColumns,
+    /// Whether the transaction holds these ops no longer: then the ops
+    /// a commit passes are only the ones after them.
+    pub(crate) held: bool,
+}
+
+impl std::fmt::Debug for EncodedOps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedOps")
+            .field("ops", &self.ops)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}
+
+impl EncodedOps {
+    /// `ops` encoded as a change by `change_actor` would encode them.
+    pub(crate) fn new<T: AsChangeOp>(
+        ops: &[T],
+        change_actor: usize,
+        actors: &[ActorId],
+    ) -> EncodedOps {
+        let mut mapper = ActorMapper::new(actors);
+        mapper.remap_actors(ops, change_actor);
+        let mut data = Vec::new();
+        let cols = encode_change_ops(ops, &mut data, &mapper.mapping);
+        EncodedOps {
+            ops: ops.len(),
+            preds: ops.iter().map(|op| T::pred(op).len()).sum(),
+            mapping: mapper.mapping,
+            data,
+            cols,
+            held: false,
+        }
+    }
+
+    /// `ops` ops by `change_actor` alone, naming no predecessor, already
+    /// encoded as `cols` in `data`, which the transaction does not hold.
+    pub(crate) fn held(
+        ops: usize,
+        change_actor: usize,
+        actors: &[ActorId],
+        data: Vec<u8>,
+        cols: ChangeOpsColumns,
+    ) -> EncodedOps {
+        let mut mapper = ActorMapper::new(actors);
+        mapper.reset();
+        mapper.build_mapping(Some(change_actor));
+        EncodedOps {
+            ops,
+            preds: 0,
+            mapping: mapper.mapping,
+            data,
+            cols,
+            held: true,
+        }
+    }
+
+    /// The columns of all of `ops`, of which these are the first: the
+    /// rest encoded and joined on, byte for byte as one encoding of
+    /// `ops` writes them. `None` where these cannot be reused: `ops`
+    /// is shorter, or its actors number differently, as when a later op
+    /// names a new one.
+    fn extend<T: AsChangeOp>(
+        self,
+        ops: &[T],
+        change_actor: usize,
+        mapper: &mut ActorMapper<'_>,
+    ) -> Option<(Vec<u8>, ChangeOpsColumns)> {
+        let tail = if self.held {
+            ops
+        } else {
+            if ops.len() < self.ops || ops.is_empty() {
+                return None;
+            }
+            &ops[self.ops..]
+        };
+        if self.held && tail.is_empty() {
+            return Some((self.data, self.cols));
+        }
+        mapper.remap_actors(if self.held { tail } else { ops }, change_actor);
+        if mapper.mapping != self.mapping {
+            assert!(!self.held, "held ops cannot be encoded again");
+            return None;
+        }
+        if tail.is_empty() {
+            return Some((self.data, self.cols));
+        }
+        let mut tail_data = Vec::new();
+        let tail_cols = encode_change_ops(tail, &mut tail_data, &mapper.mapping);
+        let tail_preds = tail.iter().map(|op| T::pred(op).len()).sum();
+        Some(self.join(&tail_data, &tail_cols, tail.len(), tail_preds))
+    }
+
+    /// These columns followed by `tail`'s, over `m` ops naming
+    /// `m_preds` predecessors, written as one encoding writes them:
+    /// each column is loaded, the tail's values spliced on, and saved,
+    /// so runs meeting at the join merge.
+    ///
+    /// # Panics
+    ///
+    /// Where a column does not load: both sides are bytes just encoded.
+    fn join(
+        self,
+        tail_data: &[u8],
+        tail: &ChangeOpsColumns,
+        m: usize,
+        m_preds: usize,
+    ) -> (Vec<u8>, ChangeOpsColumns) {
+        use hexane::LoadOpts;
+        const LOADS: &str = "a column just encoded loads";
+        let (pre, pre_data, n, n_preds) = (&self.cols, &self.data, self.ops, self.preds);
+        let mut out = Vec::with_capacity(pre_data.len() + tail_data.len());
+        // A column left out where every value is `$u`.
+        macro_rules! join_unless {
+            ($ty:ty, $f:ident, $u:expr) => {{
+                let opts = |len| LoadOpts::new().with_length(len).with_fill($u);
+                let mut c = <$ty>::load_with(&pre_data[pre.$f.clone()], opts(n)).expect(LOADS);
+                let t = <$ty>::load_with(&tail_data[tail.$f.clone()], opts(m)).expect(LOADS);
+                c.splice(n, 0, t.iter());
+                c.save_to_unless(&mut out, $u)
+            }};
+        }
+        // A column always written, `$a` values long before the join and
+        // `$b` after.
+        macro_rules! join {
+            ($ty:ty, $f:ident, $a:expr, $b:expr) => {{
+                let opts = |len| LoadOpts::new().with_length(len);
+                let mut c = <$ty>::load_with(&pre_data[pre.$f.clone()], opts($a)).expect(LOADS);
+                let t = <$ty>::load_with(&tail_data[tail.$f.clone()], opts($b)).expect(LOADS);
+                c.splice($a, 0, t.iter());
+                c.save_to(&mut out)
+            }};
+        }
+        let obj_actor = join_unless!(hexane::Column<Option<ActorIdx>>, obj_actor, None);
+        let obj_ctr = join_unless!(hexane::Column<Option<u64>>, obj_ctr, None);
+        let key_actor = join_unless!(hexane::Column<Option<ActorIdx>>, key_actor, None);
+        let key_ctr = join_unless!(hexane::DeltaColumn<Option<i64>>, key_ctr, None);
+        let key_str = join_unless!(hexane::Column<Option<String>>, key_str, None);
+        let insert = join!(hexane::Column<bool>, insert, n, m);
+        let action = join!(hexane::Column<Action>, action, n, m);
+        let value_meta = join!(hexane::Column<ValueMeta>, value_meta, n, m);
+        let start = out.len();
+        out.extend_from_slice(&pre_data[pre.value.clone()]);
+        out.extend_from_slice(&tail_data[tail.value.clone()]);
+        let value = start..out.len();
+        let pred_count = join!(hexane::Column<u32>, pred_count, n, m);
+        let pred_actor = join!(hexane::Column<ActorIdx>, pred_actor, n_preds, m_preds);
+        let pred_ctr = join!(hexane::DeltaColumn<i64>, pred_ctr, n_preds, m_preds);
+        let expand = join_unless!(hexane::Column<bool>, expand, false);
+        let mark_name = join_unless!(hexane::Column<Option<String>>, mark_name, None);
+        let cols = ChangeOpsColumns {
+            obj_actor,
+            obj_ctr,
+            key_actor,
+            key_ctr,
+            key_str,
+            insert,
+            action,
+            value_meta,
+            value,
+            pred_count,
+            pred_actor,
+            pred_ctr,
+            expand,
+            mark_name,
+        };
+        (out, cols)
     }
 }
