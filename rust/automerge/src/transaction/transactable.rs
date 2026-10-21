@@ -5,6 +5,16 @@ use crate::iter::Span;
 use crate::marks::{ExpandMark, Mark, UpdateSpansConfig};
 use crate::{AutomergeError, ChangeHash, ObjType, Prop, ReadDoc, ScalarValue};
 
+/// One write of a [`Transactable::batch_write`]: to a map key, a scalar
+/// put or an increment of a counter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchWrite {
+    /// Set the key to the value, as [`Transactable::put`] does.
+    Put(ScalarValue),
+    /// Add to the counter at the key, as [`Transactable::increment`] does.
+    Increment(i64),
+}
+
 /// A way of mutating a document within a single change.
 pub trait Transactable: ReadDoc {
     /// Get the number of pending operations in this transaction.
@@ -169,6 +179,27 @@ pub trait Transactable: ReadDoc {
         obj: O,
         new_value: &crate::hydrate::Value,
     ) -> Result<(), crate::error::UpdateObjectError>;
+
+    /// Make many scalar puts and counter increments to map keys as one
+    /// batch.
+    ///
+    /// The result is exactly the ops the same calls to [`Self::put`] and
+    /// [`Self::increment`], in that order, would make: the same ids, the
+    /// same change, the same patches, in write order. What differs is
+    /// the cost: the ops land in the op set in one pass per column rather
+    /// than one splice each, so a batch of thousands costs a few
+    /// microseconds a write instead of tens. Each entry gives the op's id
+    /// as `put` would, `None` for a put of the value already there.
+    ///
+    /// A write to a list or text index, or to an object that is not a
+    /// map, is refused with [`AutomergeError::InvalidOp`]; an increment
+    /// of a key holding no counter with [`AutomergeError::MissingCounter`].
+    /// On an error the writes before it stand, as the same calls one at
+    /// a time would have left them.
+    fn batch_write<O: AsRef<ExId>, P: Into<Prop>, I: IntoIterator<Item = (O, P, BatchWrite)>>(
+        &mut self,
+        writes: I,
+    ) -> Result<Vec<Option<ExId>>, AutomergeError>;
 
     /// Put or insert a nested `hydrate::Value` as a new object tree using
     /// batch operations.
