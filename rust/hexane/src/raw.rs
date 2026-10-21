@@ -235,19 +235,33 @@ impl RawColumn {
 
         let (si, offset) = self.find_slab(index);
 
-        let mut range = si..(si + 1);
-        let mut old_slab_len = self.slabs[si].data.len();
-        let old_weight = old_slab_len;
+        let old_weight = self.slabs[si].data.len();
         let old_slab_count = self.slabs.len();
+        let mut range;
+        let mut old_slab_len;
+        let overflow_del;
+        let left_len = if si > 0 {
+            self.slabs[si - 1].data.len()
+        } else {
+            0
+        };
+        if let Some(rest) = self.join_left(si, offset, del, bytes) {
+            range = si - 1..si + 1;
+            old_slab_len = left_len + old_weight;
+            overflow_del = rest;
+        } else {
+            range = si..si + 1;
+            old_slab_len = old_weight;
+            let (overflow, rest) =
+                splice_slab(&mut self.slabs[si], offset, del, bytes, self.max_segments);
+            overflow_del = rest;
 
-        let (overflow, overflow_del) =
-            splice_slab(&mut self.slabs[si], offset, del, bytes, self.max_segments);
-
-        // Insert overflow slabs.
-        if !overflow.is_empty() {
-            let pos = range.end;
-            range.end += overflow.len();
-            self.slabs.splice(pos..pos, overflow);
+            // Insert overflow slabs.
+            if !overflow.is_empty() {
+                let pos = range.end;
+                range.end += overflow.len();
+                self.slabs.splice(pos..pos, overflow);
+            }
         }
 
         // Apply remaining deletes to subsequent slabs.
@@ -354,6 +368,47 @@ impl RawColumn {
         debug_assert_eq!(self.index.items_before(self.index.len()), self.total_len);
 
         Ok(())
+    }
+
+    /// A splice into a shared slab, at `offset` in slab `si`, whose left
+    /// neighbor is an owned slab with room for the shared bytes before
+    /// the splice point and the inserted ones: both go onto that
+    /// neighbor and the shared range moves past them. No slab is made or
+    /// removed, and every boundary is still a splice point, the last
+    /// one's and this one's, so no value crosses a slab. Ops arrive in
+    /// key order, so a change's puts walk forward through loaded bytes;
+    /// without this each put split the shared slab in three and the
+    /// merge after folded two of the pieces back, four shifts of the
+    /// slab vector for one put (issue 2704). Returns the deletes left
+    /// over past the shared slab, or `None` when the splice is not of
+    /// this shape: the first splice into loaded bytes, a neighbor that
+    /// is full or shared, or none at all.
+    fn join_left(&mut self, si: usize, offset: usize, del: usize, bytes: &[u8]) -> Option<usize> {
+        if si == 0 {
+            return None;
+        }
+        let SlabBytes::Shared(..) = self.slabs[si].data else {
+            return None;
+        };
+        let SlabBytes::Owned(left) = &self.slabs[si - 1].data else {
+            return None;
+        };
+        if left.len() + offset + bytes.len() > self.max_segments {
+            return None;
+        }
+        let (left, this) = self.slabs.split_at_mut(si);
+        let SlabBytes::Owned(left) = &mut left[si - 1].data else {
+            unreachable!()
+        };
+        let SlabBytes::Shared(buf, at) = &mut this[0].data else {
+            unreachable!()
+        };
+        let slab_len = at.len();
+        let local_del = del.min(slab_len - offset);
+        left.extend_from_slice(&buf[at.start..at.start + offset]);
+        left.extend_from_slice(bytes);
+        at.start += offset + local_del;
+        Some(del - local_del)
     }
 
     fn find_slab(&self, index: usize) -> (usize, usize) {
@@ -1123,6 +1178,109 @@ mod tests {
         model.splice(100..100, b"abc".iter().copied());
         model.splice(250..260, b"xy".iter().copied());
         assert_eq!(col.save(), model);
+    }
+
+    /// Puts that walk forward through loaded bytes, as a change's ops do,
+    /// join the owned slab the first put made, instead of splitting the
+    /// shared slab at each and merging the pieces back (issue 2704): the
+    /// slab count stays at three while the slab has room, every
+    /// boundary is a splice point, and `get` reads each value whole.
+    #[test]
+    fn forward_puts_into_loaded_bytes_join_the_owned_slab_before_them() {
+        let loaded: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut col = RawColumn::load_with_max_segments(&loaded, 64).unwrap();
+        let mut model = loaded.clone();
+        col.splice_slice(100, 0, b"abc");
+        model.splice(100..100, b"abc".iter().copied());
+        assert_eq!(col.slabs.len(), 3, "prefix, inserted bytes, suffix");
+        // Ten shared bytes on, then right at the last put's end.
+        col.splice_slice(113, 0, b"de");
+        model.splice(113..113, b"de".iter().copied());
+        col.splice_slice(115, 0, b"fgh");
+        model.splice(115..115, b"fgh".iter().copied());
+        assert_eq!(col.slabs.len(), 3, "the puts joined the owned slab");
+        assert!(
+            matches!(col.slabs[1].data, SlabBytes::Owned(_)),
+            "the joined slab is owned"
+        );
+        assert_eq!(&col.slabs[1].data[..], &model[100..118]);
+        assert_eq!(col.get(100..103), b"abc");
+        assert_eq!(col.get(103..113), &loaded[100..110]);
+        assert_eq!(col.get(113..115), b"de");
+        assert_eq!(col.get(115..118), b"fgh");
+        assert_index(&col, "after the joins");
+        drive(&col, &model);
+    }
+
+    /// A put at the very start of loaded bytes has no slab before it and
+    /// splits as before; the next put, at its end, joins the slab it made.
+    #[test]
+    fn a_put_at_the_start_of_loaded_bytes_splits_and_the_next_joins_it() {
+        let loaded: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut col = RawColumn::load_with_max_segments(&loaded, 64).unwrap();
+        col.splice_slice(0, 0, b"X");
+        assert_eq!(col.slabs.len(), 2, "the inserted bytes, then the loaded");
+        col.splice_slice(1, 0, b"y");
+        assert_eq!(col.slabs.len(), 2, "joined");
+        assert_eq!(&col.slabs[0].data[..], b"Xy");
+        col.splice_slice(5, 2, b"z");
+        assert_eq!(col.slabs.len(), 2, "joined, dropping the deleted bytes");
+        let mut model = loaded.clone();
+        model.splice(0..0, b"Xy".iter().copied());
+        model.splice(5..7, b"z".iter().copied());
+        assert_eq!(&col.slabs[0].data[..], &model[..6]);
+        assert_index(&col, "after the joins");
+        drive(&col, &model);
+    }
+
+    /// A put whose owned neighbor has no room for the shared bytes before
+    /// it and itself splits the shared slab instead; the merge after folds
+    /// the small shared piece into the inserted slab, which takes the
+    /// puts after it.
+    #[test]
+    fn a_put_whose_left_neighbor_is_full_splits_the_shared_slab() {
+        let loaded: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut col = RawColumn::load_with_max_segments(&loaded, 64).unwrap();
+        let mut model = loaded.clone();
+        let fifty = [b'f'; 50];
+        col.splice_slice(100, 0, &fifty);
+        model.splice(100..100, fifty.iter().copied());
+        assert_eq!(col.slabs.len(), 3);
+        // 50 held + 10 shared + 8 inserted > 64: no join.
+        col.splice_slice(160, 0, b"12345678");
+        model.splice(160..160, b"12345678".iter().copied());
+        assert_eq!(
+            col.slabs.len(),
+            4,
+            "prefix, full, the shared piece merged into the inserted, suffix"
+        );
+        assert_eq!(&col.slabs[1].data[..], &fifty);
+        assert_eq!(&col.slabs[2].data[..], &model[150..168]);
+        col.splice_slice(170, 0, b"9");
+        model.splice(170..170, b"9".iter().copied());
+        assert_eq!(col.slabs.len(), 4, "joined the slab the last put made");
+        assert_eq!(&col.slabs[2].data[..], &model[150..171]);
+        assert_index(&col, "after the splits and the join");
+        drive(&col, &model);
+    }
+
+    /// A join whose delete reaches past the shared slab leaves the rest
+    /// of the delete to the slabs after it.
+    #[test]
+    fn a_join_with_a_delete_past_the_shared_slab() {
+        let loaded: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut col = RawColumn::load_with_max_segments(&loaded, 64).unwrap();
+        let mut model = loaded.clone();
+        col.splice_slice(100, 0, b"abc");
+        model.splice(100..100, b"abc".iter().copied());
+        col.splice_slice(200, 0, b"xyz");
+        model.splice(200..200, b"xyz".iter().copied());
+        // Joins at 105 (two shared bytes walked), deleting the rest of the
+        // middle shared slab, the owned "xyz" and ten bytes of the suffix.
+        col.splice_slice(105, 200 - 105 + 3 + 10, b"q");
+        model.splice(105..105 + 200 - 105 + 3 + 10, b"q".iter().copied());
+        assert_index(&col, "after the join with a long delete");
+        drive(&col, &model);
     }
 
     /// Deleting every byte, across every slab, leaves no slab and an
