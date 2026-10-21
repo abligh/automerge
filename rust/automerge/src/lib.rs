@@ -259,7 +259,6 @@ macro_rules! __log {
      }
  }
 
-mod actor;
 pub mod anonymize;
 mod author;
 mod autocommit;
@@ -292,7 +291,6 @@ mod text_value;
 pub mod transaction;
 mod types;
 mod value;
-mod write_frontier;
 
 pub use crate::anonymize::AnonymizeError;
 pub use crate::automerge::{Automerge, LoadOptions, OnPartialLoad, SaveOptions, StringMigration};

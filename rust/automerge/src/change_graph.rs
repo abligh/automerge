@@ -5,9 +5,6 @@ use std::num::NonZeroU32;
 use std::ops::Add;
 use std::ops::RangeBounds;
 
-#[cfg(test)]
-use crate::actor::ActorInsert;
-use crate::actor::{ActorIndexed, ActorRefs, ActorRemoval, ActorShift, ActorTable};
 use crate::storage::BundleMetadata;
 use crate::{
     author::Authors,
@@ -27,16 +24,13 @@ use crate::{
 /// This is a sort of adjacency list based representation, except that instead of using linked
 /// lists, we keep all the edges and nodes in two vecs and reference them by index which plays nice
 /// with the cache
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ChangeGraph {
     edges: Vec<Edge>,
     hashes: Vec<ChangeHash>,
-    /// Each change's actor, indexed by change.
-    actors: ActorRefs<Vec<ActorIdx>>,
+    actors: Vec<ActorIdx>,
     parents: Vec<Option<EdgeIdx>>,
     seq: Vec<u32>,
-    /// A mapping from a [`NodeIdx`] to the maximum op-counter in a given
-    /// commit.
     max_ops: Vec<u32>,
     max_op: u32,
     num_ops: hexane::Column<u64>,
@@ -47,8 +41,7 @@ pub(crate) struct ChangeGraph {
     heads: BTreeSet<ChangeHash>,
     nodes_by_hash: HashMap<ChangeHash, NodeIdx>,
     clock_cache: HashMap<NodeIdx, SeqClock>,
-    /// Each actor's changes, in `seq` order.
-    seq_index: ActorIndexed<Vec<NodeIdx>>,
+    seq_index: Vec<Vec<NodeIdx>>,
     fragment_top: SeqClock,
     fragments: Vec<FragmentNode>,
 }
@@ -89,13 +82,12 @@ struct Edge {
 }
 
 impl ChangeGraph {
-    /// An empty graph tracking the actors in `actors`.
-    pub(crate) fn new(actors: &ActorTable) -> Self {
+    pub(crate) fn new(num_actors: usize) -> Self {
         Self {
             edges: Vec::new(),
             nodes_by_hash: HashMap::new(),
             hashes: Vec::new(),
-            actors: ActorRefs::default(),
+            actors: Vec::new(),
             max_ops: Vec::new(),
             max_op: 0,
             num_ops: hexane::Column::new(),
@@ -107,9 +99,9 @@ impl ChangeGraph {
             extra_bytes_raw: Vec::new(),
             heads: BTreeSet::new(),
             clock_cache: HashMap::new(),
-            seq_index: ActorIndexed::new(actors),
+            seq_index: vec![vec![]; num_actors],
             fragments: vec![],
-            fragment_top: SeqClock::new(actors),
+            fragment_top: SeqClock::new(num_actors),
         }
     }
 
@@ -152,61 +144,45 @@ impl ChangeGraph {
             .map(|h| self.nodes_by_hash.get(h).unwrap().0 as u64)
     }
 
-    /// The subset of `heads` not yet witnessed by this graph.
-    pub(crate) fn missing_hashes<'a, 'b>(
-        &'a self,
-        heads: &'b [ChangeHash],
-    ) -> impl Iterator<Item = ChangeHash> + 'a
-    where
-        'b: 'a,
-    {
-        heads
-            .iter()
-            .filter(|h| !self.nodes_by_hash.contains_key(h))
-            .copied()
+    pub(crate) fn num_actors(&self) -> usize {
+        self.seq_index.len()
     }
 
-    /// Get the maximum operation of the `actor` and `seq` number.
-    pub(crate) fn max_op_for_seq(&self, actor: usize, seq: NonZeroU32) -> Option<u32> {
-        self.seq_index
-            .get(actor)
-            .and_then(|v| v.get(seq.get() as usize - 1))
-            .and_then(|n| self.max_ops.get(n.0 as usize))
-            .copied()
-    }
-
-    /// Make room for an actor just inserted into the document's actor table.
-    pub(crate) fn insert_actor(&mut self, shift: &ActorShift) {
-        self.actors.shift_actors(shift);
-
+    pub(crate) fn insert_actor(&mut self, idx: usize) {
+        if self.seq_index.len() != idx {
+            for actor_index in &mut self.actors {
+                if actor_index.0 >= idx as u32 {
+                    actor_index.0 += 1;
+                }
+            }
+        }
         for clock in self.clock_cache.values_mut() {
-            clock.shift_actor(shift)
+            clock.rewrite_with_new_actor(idx)
         }
         for f in &mut self.fragments {
-            f.clock.shift_actor(shift)
+            f.clock.rewrite_with_new_actor(idx)
         }
-        self.fragment_top.shift_actor(shift);
-        self.seq_index.insert(shift, vec![]);
+        self.fragment_top.rewrite_with_new_actor(idx);
+        self.seq_index.insert(idx, vec![]);
     }
 
-    /// Forget an actor just removed from the document's actor table. The
-    /// actor must have no changes in the graph.
-    pub(crate) fn remove_actor(&mut self, removal: &ActorRemoval) {
-        let idx = removal.index();
-        self.actors
-            .remove_actor(removal)
-            .expect("removed actor still has changes in the graph");
+    pub(crate) fn remove_actor(&mut self, idx: usize) {
+        for actor_index in &mut self.actors {
+            if actor_index.0 > idx as u32 {
+                actor_index.0 -= 1;
+            }
+        }
         if self.seq_index.get(idx).is_some() {
             assert!(self.seq_index[idx].is_empty());
-            self.seq_index.remove(removal);
+            self.seq_index.remove(idx);
         }
         for clock in &mut self.clock_cache.values_mut() {
-            clock.remove_actor(removal)
+            clock.remove_actor(idx)
         }
         for fragment in &mut self.fragments {
-            fragment.clock.remove_actor(removal)
+            fragment.clock.remove_actor(idx)
         }
-        self.fragment_top.remove_actor(removal);
+        self.fragment_top.remove_actor(idx);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -229,7 +205,7 @@ impl ChangeGraph {
         self.max_op as u64
     }
 
-    pub(crate) fn max_op_for_actor(&self, actor_index: usize) -> u64 {
+    pub(crate) fn max_op_for_actor(&mut self, actor_index: usize) -> u64 {
         self.seq_index
             .get(actor_index)
             .and_then(|s| s.last())
@@ -566,6 +542,46 @@ impl ChangeGraph {
         }
     }
 
+    fn add_changes<'a, I: Iterator<Item = (&'a Change, usize)> + ExactSizeIterator + Clone>(
+        &mut self,
+        iter: I,
+        authors: &mut Authors,
+    ) -> Result<(), MissingDep> {
+        let node = NodeIdx(self.hashes.len() as u32);
+
+        self.add_nodes(iter.clone());
+
+        for (i, (change, actor)) in iter.enumerate() {
+            let node_idx = node + i;
+            let hash = change.hash();
+            self.max_op = std::cmp::max(self.max_op, change.max_op() as u32);
+            self.hashes.push(hash);
+            debug_assert!(!self.nodes_by_hash.contains_key(&hash));
+            self.nodes_by_hash.insert(hash, node_idx);
+            self.update_heads(change);
+
+            if let Some(author) = change.author() {
+                assert!(change.seq() == 1);
+                authors.assign_author(author.into_owned(), actor)
+            }
+
+            assert!(actor < self.seq_index.len());
+            assert_eq!(self.seq_index[actor].len() + 1, change.seq() as usize);
+            self.seq_index[actor].push(node_idx);
+
+            for parent_hash in change.deps().iter() {
+                self.add_parent(node_idx, parent_hash);
+            }
+
+            if (node_idx + 1).0.is_multiple_of(CACHE_STEP) {
+                self.cache_clock(node_idx);
+            }
+
+            self.cache_fragment(node_idx);
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_fragment(&self, head: ChangeHash) -> Option<Fragment> {
         let n = self.nodes_by_hash.get(&head).copied()?;
         if head.fragment_level() == 0 {
@@ -694,11 +710,11 @@ impl ChangeGraph {
         change: &Change,
         actor: usize,
         authors: &mut Authors,
-    ) -> Result<ChangeHash, MissingDep> {
+    ) -> Result<(), MissingDep> {
         let hash = change.hash();
 
         if self.nodes_by_hash.contains_key(&hash) {
-            return Ok(hash);
+            return Ok(());
         }
 
         for h in change.deps().iter() {
@@ -707,40 +723,11 @@ impl ChangeGraph {
             }
         }
 
-        let node_idx = NodeIdx(self.hashes.len() as u32);
-
-        self.add_nodes([(change, actor)].into_iter());
-
-        self.max_op = std::cmp::max(self.max_op, change.max_op() as u32);
-        self.hashes.push(hash);
-        debug_assert!(!self.nodes_by_hash.contains_key(&hash));
-        self.nodes_by_hash.insert(hash, node_idx);
-        self.update_heads(change);
-
-        if let Some(author) = change.author() {
-            assert!(change.seq() == 1);
-            authors.assign_author(author.into_owned(), actor)
-        }
-
-        assert!(actor < self.seq_index.len());
-        assert_eq!(self.seq_index[actor].len() + 1, change.seq() as usize);
-        self.seq_index.as_mut_slice()[actor].push(node_idx);
-
-        for parent_hash in change.deps().iter() {
-            self.add_parent(node_idx, parent_hash);
-        }
-
-        if (node_idx + 1).0.is_multiple_of(CACHE_STEP) {
-            self.cache_clock(node_idx);
-        }
-
-        self.cache_fragment(node_idx);
-
-        Ok(hash)
+        self.add_changes([(change, actor)].into_iter(), authors)
     }
 
     fn cache_clock(&mut self, node_idx: NodeIdx) -> SeqClock {
-        let mut clock = self.fragment_top.empty_like();
+        let mut clock = SeqClock::new(self.num_actors());
         let mut to_visit = BTreeSet::from([node_idx]);
 
         self.calculate_clock_inner(&mut clock, &mut to_visit, CACHE_STEP as usize * 2);
@@ -807,13 +794,15 @@ impl ChangeGraph {
     pub(crate) fn clock_at(&self, heads: &[ChangeHash]) -> Clock {
         let nodes = self.heads_to_nodes(heads);
         self.calculate_clock(nodes.collect())
-            .map_to_clock(|actor, seq| {
+            .iter()
+            .map(|(actor, seq)| {
                 self.seq_index
                     .get(actor)
-                    .and_then(|v| v.get(seq.get() as usize - 1))
+                    .and_then(|v| v.get(seq?.get() as usize - 1))
                     .and_then(|i| self.max_ops.get(i.0 as usize))
                     .copied()
             })
+            .collect()
     }
 
     pub(crate) fn seq_clock_for_heads(&self, heads: &[ChangeHash]) -> SeqClock {
@@ -826,7 +815,7 @@ impl ChangeGraph {
     }
 
     fn calculate_clock(&self, mut to_visit: BTreeSet<NodeIdx>) -> SeqClock {
-        let mut clock = self.fragment_top.empty_like();
+        let mut clock = SeqClock::new(self.num_actors());
 
         self.calculate_clock_inner(&mut clock, &mut to_visit, usize::MAX);
 
@@ -901,11 +890,7 @@ impl ChangeGraphCols {
         self.0.iter()
     }
 
-    pub(crate) fn finalize(
-        self,
-        changes: &[Change],
-        authors: &mut Authors,
-    ) -> Result<ChangeGraph, LoadError> {
+    pub(crate) fn finalize(self, changes: &[Change], authors: &mut Authors) -> ChangeGraph {
         let mut graph = self.0;
         debug_assert_eq!(changes.len(), graph.len());
         debug_assert!(graph.hashes.is_empty());
@@ -923,17 +908,6 @@ impl ChangeGraphCols {
             graph.nodes_by_hash.insert(hash, node_idx);
             graph.hashes.push(hash);
             if let Some(author) = c.author() {
-                // Honest encoders only carry the author footer on seq=1; the
-                // apply path rejects anything else. Loading must reject it
-                // too: skipping the footer would leave the ops unattributed
-                // (so masking could never hide them) while Change::author
-                // still reports the author.
-                if c.seq() != 1 {
-                    return Err(LoadError::AuthorOnNonInitialSeq(
-                        c.seq(),
-                        c.actor_id().clone(),
-                    ));
-                }
                 authors.assign_author(author.into_owned(), graph.actors[idx].into());
             }
         }
@@ -946,14 +920,13 @@ impl ChangeGraphCols {
 
         graph.cache_fragments();
 
-        Ok(graph)
+        graph
     }
 
-    /// Load the change columns of `doc`, whose actors are `actor_table`.
-    pub(crate) fn load(doc: &Document<'_>, actor_table: &ActorTable) -> Result<Self, LoadError> {
+    pub(crate) fn load(doc: &Document<'_>) -> Result<Self, LoadError> {
         use ids::*;
 
-        let num_actors = actor_table.len();
+        let num_actors = doc.actors().len();
         let meta = doc.change_meta();
         let bytes = doc.change_bytes();
 
@@ -968,8 +941,7 @@ impl ChangeGraphCols {
 
         let extra_bytes_raw = meta.bytes(EXTRA_VAL_COL_SPEC, bytes).to_vec();
 
-        let actors: ActorRefs<Vec<ActorIdx>> =
-            ActorRefs(hexane::decoder::<ActorIdx>(actor_bytes).collect());
+        let actors: Vec<ActorIdx> = hexane::decoder::<ActorIdx>(actor_bytes).collect();
         let max_ops: Vec<u32> = hexane::DeltaDecoder::<u32>::new(max_op_bytes).collect();
         let max_op = max_ops.iter().copied().max().unwrap_or(0);
         let seq: Vec<u32> = hexane::DeltaDecoder::<u32>::new(seq_bytes).collect();
@@ -1002,10 +974,10 @@ impl ChangeGraphCols {
             return Err(LoadError::InvalidColumnLength(MESSAGE_COL_SPEC));
         }
 
-        let mut seq_index: ActorIndexed<Vec<NodeIdx>> = ActorIndexed::new(actor_table);
+        let mut seq_index = vec![vec![]; num_actors];
         for (i, actor) in actors.iter().enumerate() {
             let actor = actor.0 as usize;
-            seq_index.as_mut_slice()[actor].push(NodeIdx(i as u32));
+            seq_index[actor].push(NodeIdx(i as u32));
         }
 
         let mut parents = Vec::with_capacity(len);
@@ -1053,7 +1025,7 @@ impl ChangeGraphCols {
         let hashes = vec![];
         let nodes_by_hash = HashMap::new();
         let fragments = vec![];
-        let fragment_top = SeqClock::new(actor_table);
+        let fragment_top = SeqClock::new(num_actors);
 
         Ok(ChangeGraphCols(ChangeGraph {
             edges,
@@ -1110,88 +1082,13 @@ mod tests {
         let graph = builder.build();
 
         // todo - why 4?
-        let mut expected_clock = SeqClock::new(&builder.actors);
+        let mut expected_clock = SeqClock::new(3);
         expected_clock.include(builder.index(&actor1), Some(2));
         expected_clock.include(builder.index(&actor2), Some(1));
         expected_clock.include(builder.index(&actor3), Some(1));
 
         let clock = graph.seq_clock_for_heads(&[change4]);
         assert_eq!(clock, expected_clock);
-    }
-
-    /// A DOCUMENT chunk carrying an author footer on a seq!=1 change must
-    /// fail to load, exactly like the same change applied directly
-    /// (`AutomergeError::AuthorOnNonInitialSeq`). Skipping the footer would
-    /// leave the ops unattributed — unhideable by masking — while
-    /// `Change::author` still reports the author. Such bytes cannot be built
-    /// through the public API (both the encoder and the apply path enforce
-    /// the invariant), so the guard is pinned at the reconstruction level:
-    /// real document columns, with the forged footer spliced into the
-    /// decoded change list that `reconstruct` hands to `finalize`.
-    #[test]
-    fn finalize_rejects_author_footer_at_non_initial_seq() {
-        use crate::storage::{parse::Input, Chunk};
-        use crate::{Author, ExpandedChange};
-
-        // A real two-change document from a single actor.
-        let mut doc = AutoCommit::new();
-        doc.put(ROOT, "k1", "v1").unwrap();
-        doc.commit();
-        doc.put(ROOT, "k2", "v2").unwrap();
-        doc.commit();
-        let saved = doc.save();
-        let (_, chunk) = Chunk::parse(Input::new(&saved)).unwrap();
-        let Chunk::Document(document) = chunk else {
-            panic!("expected a document chunk");
-        };
-        let actors = document.actors().clone().into_table().unwrap();
-        let cols = ChangeGraphCols::load(&document, &actors).unwrap();
-
-        // Forge the seq=2 change: re-encode it with an author footer in
-        // extra_bytes, the same encoding transaction/inner.rs::extra_bytes
-        // writes (Footer::Author discriminant 1, then a LEB128 length).
-        let author = Author::try_from("ffff").unwrap();
-        let mut changes = doc.get_changes(&[]);
-        changes.sort_by_key(Change::seq);
-        assert_eq!(changes.len(), 2);
-        let mut expanded: ExpandedChange = (&changes[1]).into();
-        expanded.extra_bytes = vec![1, author.as_bytes().len() as u8];
-        expanded.extra_bytes.extend_from_slice(author.as_bytes());
-        let forged: Change = expanded.into();
-        assert_eq!(forged.seq(), 2);
-        assert!(forged.author().is_some());
-        let forged_changes = vec![changes[0].clone(), forged];
-
-        let mut authors = Authors::new(&actors);
-        let err = cols
-            .finalize(&forged_changes, &mut authors)
-            .expect_err("an author footer at seq 2 must fail the load");
-        assert!(
-            matches!(err, LoadError::AuthorOnNonInitialSeq(2, _)),
-            "expected AuthorOnNonInitialSeq(2, _), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn max_op_for_seq_translates_a_seq_to_that_changes_max_op() {
-        let mut builder = TestGraphBuilder::new();
-        let actor1 = builder.actor();
-        let actor2 = builder.actor();
-        let change1 = builder.change(&actor1, 10, &[]); // ops 1..=10
-        builder.change(&actor1, 5, &[change1]); // ops 11..=15
-        let graph = builder.build();
-        let a1 = builder.index(&actor1);
-        let a2 = builder.index(&actor2);
-        let seq = |n: u32| std::num::NonZeroU32::new(n).unwrap();
-        // a known seq maps to the max op counter of that change
-        assert_eq!(graph.max_op_for_seq(a1, seq(1)), Some(10));
-        assert_eq!(graph.max_op_for_seq(a1, seq(2)), Some(15));
-        // a seq past the actor's recorded history has no translation
-        assert_eq!(graph.max_op_for_seq(a1, seq(3)), None);
-        // an actor with no changes has none either
-        assert_eq!(graph.max_op_for_seq(a2, seq(1)), None);
-        // as does an actor the graph has never seen
-        assert_eq!(graph.max_op_for_seq(99, seq(1)), None);
     }
 
     #[test]
@@ -1218,7 +1115,7 @@ mod tests {
     }
 
     struct TestGraphBuilder {
-        actors: ActorTable,
+        actors: Vec<ActorId>,
         changes: Vec<Change>,
         graph: ChangeGraph,
         seqs_by_actor: BTreeMap<ActorId, u64>,
@@ -1227,29 +1124,25 @@ mod tests {
 
     impl TestGraphBuilder {
         fn new() -> Self {
-            let actors = ActorTable::new();
             TestGraphBuilder {
-                graph: ChangeGraph::new(&actors),
-                actors,
+                actors: Vec::new(),
                 changes: Vec::new(),
+                graph: ChangeGraph::new(0),
                 seqs_by_actor: BTreeMap::new(),
                 rng: crate::make_rng(),
             }
         }
 
-        /// Create a new random [`ActorId`], inserted into the graph.
         fn actor(&mut self) -> ActorId {
             use rand::RngExt;
             let actor = ActorId::from(self.rng.random::<[u8; 16]>().to_vec());
-            match self.actors.insert(actor.clone()) {
-                ActorInsert::Inserted(shift) => self.graph.insert_actor(&shift),
-                ActorInsert::Existing(_) => panic!("random actor already present"),
-            }
+            self.graph.insert_actor(self.actors.len());
+            self.actors.push(actor.clone());
             actor
         }
 
         fn index(&self, actor: &ActorId) -> usize {
-            self.actors.lookup(actor).unwrap()
+            self.actors.iter().position(|a| a == actor).unwrap()
         }
 
         /// Create a change with `num_new_ops` and `parents` for `actor`
@@ -1262,8 +1155,8 @@ mod tests {
             num_new_ops: usize,
             parents: &[ChangeHash],
         ) -> ChangeHash {
-            let mut authors = Authors::new(&self.actors);
-            let osd = OpSet::from_actors(self.actors.to_vec(), TextEncoding::platform_default());
+            let mut authors = Authors::default();
+            let osd = OpSet::from_actors(self.actors.clone(), TextEncoding::platform_default());
 
             let start_op = parents
                 .iter()
@@ -1319,8 +1212,8 @@ mod tests {
         }
 
         fn build(&self) -> ChangeGraph {
-            let mut authors = Authors::new(&self.actors);
-            let mut graph = ChangeGraph::new(&self.actors);
+            let mut authors = Authors::with_actors(self.actors.len());
+            let mut graph = ChangeGraph::new(self.actors.len());
             for change in &self.changes {
                 let actor_idx = self.index(change.actor_id());
                 graph.add_change(change, actor_idx, &mut authors).unwrap();

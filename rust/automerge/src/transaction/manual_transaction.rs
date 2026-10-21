@@ -1,4 +1,3 @@
-use crate::automerge::view;
 use crate::exid::ExId;
 use crate::patches::PatchLog;
 use crate::ChangeHash;
@@ -53,14 +52,7 @@ impl<'a> Transaction<'a> {
         args: TransactionArgs,
         opts: CommitOptions,
     ) -> ChangeHash {
-        let (hash, history) = TransactionInner::empty(doc, args, opts.message, opts.time);
-        if let crate::automerge::HistoryUpdate::BoundaryResolved = history {
-            // No patch log observes this change, but a resolved pending
-            // boundary must still publish the new visibility mask.
-            doc.republish_mask(&mut PatchLog::inactive(), |_| {})
-                .expect("a fresh patch log belongs to any document");
-        }
-        hash
+        TransactionInner::empty(doc, args, opts.message, opts.time)
     }
 }
 
@@ -106,24 +98,27 @@ impl Transaction<'_> {
     /// Undo the operations added in this transaction, returning the number of cancelled
     /// operations.
     pub fn rollback(mut self) -> usize {
-        self.patch_log.abandon_transaction(self.doc.actors());
+        self.patch_log.finish_transaction(&self.doc.ops().actors);
         self.inner.take().unwrap().rollback(self.doc)
     }
 
     fn do_tx<F, O>(&mut self, f: F) -> O
     where
-        F: for<'e> FnOnce(
-            &mut TransactionInner,
-            &mut Automerge,
-            &mut crate::patches::Events<'e>,
-        ) -> O,
+        F: FnOnce(&mut TransactionInner, &mut Automerge, &mut PatchLog) -> O,
     {
         let tx = self.inner.as_mut().unwrap();
-        f(tx, self.doc, &mut self.patch_log.events())
+        f(tx, self.doc, &mut self.patch_log)
     }
 
-    fn get_scope(&self, heads: Option<&[ChangeHash]>) -> view::ReadAt<'_> {
-        super::get_scope(self.doc, self.inner.as_ref(), heads)
+    fn get_scope(&self, heads: Option<&[ChangeHash]>) -> Option<crate::types::Clock> {
+        if let Some(h) = heads {
+            // a transaction is in flight: its pending ops are in the op set
+            // but not under the graph's heads, so the current-heads
+            // shortcut in `scope_at` would wrongly expose them
+            Some(self.doc.change_graph.clock_at(h))
+        } else {
+            self.inner.as_ref().and_then(|i| i.get_scope().clone())
+        }
     }
 
     pub(crate) fn batch_init_root_map(

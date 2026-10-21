@@ -1,14 +1,10 @@
-use crate::automerge::view::Mask;
-use crate::automerge::HistoryUpdate;
 use crate::change_queue::ChangeBatch;
 use crate::hydrate::Value;
 use crate::iter::RichTextDiff;
-use crate::op_set2::op::SuccessorValue;
 use crate::op_set2::types::{Action, KeyRef, MarkData, PropRef, ScalarValue as OpScalarValue};
 use crate::op_set2::SuccInsert;
-use crate::patches::Events;
 use crate::types::{
-    ActorId, ElemId, ObjId, ObjType, OpId, ScalarValue, SequenceType, SmallHashMap,
+    ActorId, ElemId, ObjId, ObjType, OpId, Prop, ScalarValue, SequenceType, SmallHashMap,
 };
 use crate::{Automerge, Change, ChangeHash, PatchLog, PatchLogMismatch};
 use crate::{AutomergeError, TextEncoding};
@@ -21,10 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-mod transition;
-use transition::{CandidateSummary, ValueTransition};
-
-type PredCache = SmallHashMap<OpId, Vec<SuccessorValue>>;
+type PredCache = SmallHashMap<OpId, Vec<(OpId, Option<i64>)>>;
 
 #[derive(Debug, Clone, Default)]
 struct BatchApply {
@@ -64,38 +57,33 @@ struct Untangler<'a> {
 }
 
 impl<'a> Untangler<'a> {
-    fn flush(&mut self, log: &mut Events<'_>) {
+    fn flush(&mut self, log: &mut PatchLog) {
         self.value.list_flush(self.index, log);
         self.top.reset(self.conflicts);
         self.index += self.width;
         self.width = 0;
     }
 
-    fn handle_doc_op(&mut self, doc_op: &Op<'a>, succ: &mut Vec<SuccInsert>, log: &mut Events<'_>) {
-        let effect @ SuccessorEffect { deleted, .. } = process_pred(doc_op, self.pred, succ);
+    fn handle_doc_op(&mut self, doc_op: &Op<'a>, succ: &mut Vec<SuccInsert>, log: &mut PatchLog) {
+        let mut deleted = false;
+        if let Some(mut successors) = self.pred.remove(&doc_op.id) {
+            normalize_increment_successors(doc_op.is_counter(), &mut successors);
+            for (id, inc) in successors {
+                deleted |= inc.is_none();
+                succ.push(doc_op.add_succ(id, inc));
+            }
+        }
 
         if doc_op.insert {
             self.flush(log);
             self.value.key = Some(PropRef::Seq(self.index));
         }
 
-        // A doc op hidden by the mask snapshot is invisible: it occupies no
-        // width in the patch index and takes no part in top/conflict tracking.
-        // Mask-aware visibility is computed once here and shared by the
-        // width accounting, the candidate summaries and top/conflict
-        // tracking: an op whose only deleting successor is hidden by the
-        // mask is visible (restored), so raw `Op::visible()` must not be
-        // consulted for any of them.
-        let hidden = self.value.hides(&doc_op.id);
-        let visible = !hidden && self.value.masked_visible(doc_op);
-        if visible && !deleted {
+        if doc_op.visible() && !deleted {
             self.width = doc_op.width(self.seq_type, self.text_encoding);
         }
-        self.value.process_doc_op(doc_op, effect);
-        if !hidden {
-            self.top
-                .process_doc_op(self.change_ops, doc_op, deleted, visible);
-        }
+        self.value.process_doc_op(doc_op, deleted);
+        self.top.process_doc_op(self.change_ops, doc_op, deleted);
     }
 
     fn element_update(&mut self, doc_op: &Op<'_>) {
@@ -134,13 +122,13 @@ impl<'a> Untangler<'a> {
         }
     }
 
-    fn finish_inserts(&mut self, log: &mut Events<'_>) {
+    fn finish_inserts(&mut self, log: &mut PatchLog) {
         while !self.stack.is_empty() {
             self.untangle_inner(self.max, log);
         }
     }
 
-    fn finish(mut self, log: &mut Events<'_>) {
+    fn finish(mut self, log: &mut PatchLog) {
         self.finish_updates();
 
         self.flush(log);
@@ -161,7 +149,7 @@ impl<'a> Untangler<'a> {
         });
     }
 
-    fn untangle_inserts(&mut self, id: OpId, insert_pos: usize, log: &mut Events<'_>) {
+    fn untangle_inserts(&mut self, id: OpId, insert_pos: usize, log: &mut PatchLog) {
         self.flush(log);
 
         if let Err(n) = self
@@ -180,7 +168,7 @@ impl<'a> Untangler<'a> {
         }
     }
 
-    fn untangle_inner(&mut self, insert_pos: usize, log: &mut Events<'_>) -> Option<()> {
+    fn untangle_inner(&mut self, insert_pos: usize, log: &mut PatchLog) -> Option<()> {
         let mut pos = self.stack.pop()?;
         let op = self.change_ops.get_mut(pos)?;
 
@@ -194,9 +182,9 @@ impl<'a> Untangler<'a> {
         op.subsort = self.count;
         self.count += 1;
 
-        if op.is_set_or_make() && !op.has_succ() && !op.masked {
+        if op.is_set_or_make() && !op.has_succ() {
             vis = Some(pos);
-        } else if op.action() == Action::Mark && !op.masked {
+        } else if op.action() == Action::Mark {
             self.value.process_mark(op.id(), op.mark_data());
         }
 
@@ -218,7 +206,7 @@ impl<'a> Untangler<'a> {
                 next_op.subsort = self.count;
                 self.count += 1;
 
-                next_op.is_set_or_make() && !next_op.has_succ() && !next_op.masked
+                next_op.is_set_or_make() && !next_op.has_succ()
             };
 
             if next_vis {
@@ -262,7 +250,9 @@ impl<'a> Untangler<'a> {
     }
 
     fn new(
-        value: ValueState<'a>,
+        obj: ObjId,
+        encoding: SequenceType,
+        text_encoding: TextEncoding,
         conflicts: &'a mut Vec<Adjust>,
         change_ops: &'a mut [ChangeOp],
         pred: &'a mut PredCache,
@@ -274,6 +264,7 @@ impl<'a> Untangler<'a> {
         let mut stack: Vec<usize> = Vec::with_capacity(change_ops.len());
         let mut updates: SmallHashMap<ElemId, Vec<usize>> = HashMap::default();
         let mut last_e = None;
+        let value = ValueState::new(obj, encoding, text_encoding);
         for (i, op) in change_ops.iter_mut().enumerate() {
             if let Some(mut successors) = pred.remove(&op.id()) {
                 let is_counter = matches!(op.bld.value, OpScalarValue::Counter(_));
@@ -307,8 +298,8 @@ impl<'a> Untangler<'a> {
             pred,
             change_ops,
             updates,
-            seq_type: value.seq_type,
-            text_encoding: value.text_encoding,
+            seq_type: encoding,
+            text_encoding,
             conflicts,
             updates_stack,
             top: Top::Nothing,
@@ -325,7 +316,7 @@ fn walk_list<'a>(
     mut ut: Untangler<'a>,
     doc_ops: OpIter<'a>,
     succ: &mut Vec<SuccInsert>,
-    log: &mut Events<'_>,
+    log: &mut PatchLog,
 ) {
     for op in doc_ops {
         ut.element_update(&op);
@@ -340,9 +331,9 @@ fn walk_list<'a>(
     ut.finish(log);
 }
 
-struct MapWalker<'a, 'b, 'c> {
+struct MapWalker<'a, 'b> {
     ops: OpIter<'a>,
-    log: &'b mut Events<'c>,
+    log: &'b mut PatchLog,
     pred: &'b mut PredCache,
     succ: &'b mut Vec<SuccInsert>,
     value: ValueState<'a>,
@@ -374,10 +365,8 @@ impl Top {
         *self = Top::Nothing;
     }
 
-    fn process_doc_op(&mut self, ops: &mut [ChangeOp], d: &Op<'_>, deleted: bool, visible: bool) {
-        // `visible` is the caller's mask-aware visibility for `d`; the raw
-        // successor check would miss values restored by the mask.
-        if visible {
+    fn process_doc_op(&mut self, ops: &mut [ChangeOp], d: &Op<'_>, deleted: bool) {
+        if d.visible() {
             if deleted {
                 if let Top::Doc(i) = self {
                     *self = Top::Expose(*i)
@@ -403,17 +392,19 @@ impl Top {
     }
 }
 
-impl<'a, 'b, 'c> MapWalker<'a, 'b, 'c> {
+impl<'a, 'b> MapWalker<'a, 'b> {
     fn new(
-        value: ValueState<'a>,
+        obj: ObjId,
         mut ops: OpIter<'a>,
+        text_encoding: TextEncoding,
         pred: &'b mut PredCache,
         succ: &'b mut Vec<SuccInsert>,
-        log: &'b mut Events<'c>,
+        log: &'b mut PatchLog,
         conflicts: &'b mut Vec<Adjust>,
     ) -> Self {
         let pos = ops.pos();
         let doc_op = ops.next();
+        let value = ValueState::new(obj, SequenceType::List, text_encoding);
         let top = Top::Nothing;
         MapWalker {
             ops,
@@ -461,18 +452,14 @@ impl<'a, 'b, 'c> MapWalker<'a, 'b, 'c> {
                 Some(Ordering::Greater) => break,
                 Some(Ordering::Equal) if d.id > ops[pos].id() => break,
                 _ => {
-                    let effect @ SuccessorEffect { deleted, .. } =
-                        process_pred(d, self.pred, self.succ);
+                    let deleted = process_pred(self.doc_op.as_ref(), self.pred, self.succ);
                     if d.prop() != self.value.key {
                         self.value.map_flush(self.log);
                         self.value.key = d.prop();
                         self.top.reset(self.conflicts);
                     }
-                    self.value.process_doc_op(d, effect);
-                    if !self.value.hides(&d.id) {
-                        let visible = self.value.masked_visible(d);
-                        self.top.process_doc_op(ops, d, deleted, visible);
-                    }
+                    self.value.process_doc_op(d, deleted);
+                    self.top.process_doc_op(ops, d, deleted);
                 }
             }
             self.next_doc_op();
@@ -481,13 +468,10 @@ impl<'a, 'b, 'c> MapWalker<'a, 'b, 'c> {
 
     fn finish(&mut self, ops: &mut [ChangeOp]) {
         while let Some(d) = self.doc_op.as_ref() {
-            let effect @ SuccessorEffect { deleted, .. } = process_pred(d, self.pred, self.succ);
+            let deleted = process_pred(self.doc_op.as_ref(), self.pred, self.succ);
             if d.prop() == self.value.key {
-                if !self.value.hides(&d.id) {
-                    let visible = self.value.masked_visible(d);
-                    self.top.process_doc_op(ops, d, deleted, visible);
-                }
-                self.value.process_doc_op(d, effect);
+                self.top.process_doc_op(ops, d, deleted);
+                self.value.process_doc_op(d, deleted);
                 self.next_doc_op();
             } else {
                 break;
@@ -498,116 +482,134 @@ impl<'a, 'b, 'c> MapWalker<'a, 'b, 'c> {
     }
 }
 
-/// For a non-counter predecessor, replace increment amounts with `None` so
-/// those successors are treated as overwrites. Counter predecessors retain
-/// their increment amounts.
-fn normalize_increment_successors(is_counter: bool, successors: &mut [SuccessorValue]) {
+fn normalize_increment_successors(is_counter: bool, successors: &mut [(OpId, Option<i64>)]) {
     if !is_counter {
-        for value in successors {
-            value.reset_increment();
+        for (_, increment) in successors {
+            // Increment operations preserve and update counter predecessors,
+            // but act as ordinary overwrites for non-counter predecessors.
+            if increment.is_some() {
+                *increment = None;
+            }
         }
     }
 }
 
-/// The combined effect of this batch’s successors on an existing operation:
-/// whether they suppress it, and their total counter increment.
-#[derive(Debug, Default, Clone, Copy)]
-struct SuccessorEffect {
-    deleted: bool,
-    increment: i64,
-}
-
-/// Collect the incoming successors of `d`, append their links to the deferred
-/// successor buffer, and return their combined effect on `d`.
-///
-/// After normalization, a `None` increment denotes a suppressing successor;
-/// `Some(n)` contributes a counter increment. A masked successor keeps its
-/// link in the index but contributes neither.
-fn process_pred(d: &Op<'_>, pred: &mut PredCache, succ: &mut Vec<SuccInsert>) -> SuccessorEffect {
-    let mut effect = SuccessorEffect::default();
-    if let Some(mut successors) = pred.remove(&d.id) {
-        normalize_increment_successors(d.is_counter(), &mut successors);
-        for value in successors {
-            let id = value.get_id();
-            let increment = value.get_increment();
-            if value.is_masked() {
-                succ.push(d.add_succ_with_mask(id, increment, true));
-                continue;
+fn process_pred(doc_op: Option<&Op<'_>>, pred: &mut PredCache, succ: &mut Vec<SuccInsert>) -> bool {
+    if let Some(d) = doc_op {
+        let mut deleted = false;
+        if let Some(mut successors) = pred.remove(&d.id) {
+            normalize_increment_successors(d.is_counter(), &mut successors);
+            for (id, inc) in successors {
+                deleted |= inc.is_none();
+                succ.push(d.add_succ(id, inc));
             }
-            if let Some(n) = increment {
-                effect.increment += n;
-            } else {
-                effect.deleted = true;
-            }
-            succ.push(d.add_succ(id, increment));
         }
+        deleted
+    } else {
+        false
     }
-    effect
 }
 
-/// Tracks one map property or sequence element while a batch is walked: its
-/// visible candidates before and after the batch, and its formatting context.
-///
-/// Flushing hands the two summaries to the private `transition` module, which
-/// classifies and encodes the change into the patch log.
 #[derive(Debug, Clone)]
 struct ValueState<'a> {
     obj: ObjId,
     seq_type: SequenceType,
     text_encoding: TextEncoding,
     key: Option<PropRef<'a>>,
-    before: CandidateSummary,
-    after: CandidateSummary,
+    doc: OpValueOption,
+    change: OpValueOption,
     marks: RichTextDiff<'a>,
-    /// The mask snapshot the batch walks under; fixed for the whole walk.
-    /// A doc op it hides is not a candidate in either summary.
-    mask: Option<&'a Mask>,
-    /// The op set the batch walks over, for its visibility index. The walk
-    /// completes before the batch mutates the op set, so the index is the
-    /// one derived under `mask`.
-    op_set: &'a OpSet,
+}
+
+#[derive(Debug, Clone)]
+struct OpValue {
+    id: OpId,
+    value: Value,
+    deleted: bool,
+    conflict: bool,
+    expose: bool,
+    replaced: Option<Value>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct OpValueOption(Option<OpValue>);
+
+impl OpValueOption {
+    fn id(&self) -> Option<OpId> {
+        self.value().map(|o| o.id)
+    }
+
+    fn increment(&mut self, n: i64) {
+        if let Self(Some(ov)) = self {
+            if let Value::Scalar(ScalarValue::Counter(c)) = &mut ov.value {
+                c.increment(n);
+            }
+        }
+    }
+
+    fn expose(&mut self, replaced: Value) {
+        if let Self(Some(ov)) = self {
+            ov.expose = true;
+            ov.replaced = Some(replaced);
+        }
+    }
+
+    fn set(&mut self, value: Value, id: OpId, deleted: bool) {
+        if deleted && self.is_visible() {
+            self.expose(value);
+        } else {
+            let conflict = self.is_visible();
+            let expose = !deleted && self.is_deleted();
+            *self = Self(Some(OpValue {
+                value,
+                id,
+                conflict,
+                deleted,
+                expose,
+                replaced: None,
+            }));
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        self.value().is_none()
+    }
+
+    fn value(&self) -> Option<&OpValue> {
+        self.0.as_ref()
+    }
+
+    fn is_visible(&self) -> bool {
+        self.value().map(|o| !o.deleted).unwrap_or(false)
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.value().map(|o| o.deleted).unwrap_or(false)
+    }
+
+    fn take(&mut self) -> Self {
+        Self(self.0.take())
+    }
+
+    fn into_value(self) -> Option<OpValue> {
+        self.0
+    }
 }
 
 impl<'a> ValueState<'a> {
-    fn new(
-        obj: ObjId,
-        encoding: SequenceType,
-        text_encoding: TextEncoding,
-        mask: Option<&'a Mask>,
-        op_set: &'a OpSet,
-    ) -> Self {
+    fn new(obj: ObjId, encoding: SequenceType, text_encoding: TextEncoding) -> Self {
         Self {
             obj,
             seq_type: encoding,
             text_encoding,
             key: None,
-            before: CandidateSummary::default(),
-            after: CandidateSummary::default(),
+            doc: OpValueOption(None),
+            change: OpValueOption(None),
             marks: RichTextDiff::default(),
-            mask,
-            op_set,
         }
     }
 
-    /// Whether the mask snapshot hides this doc op.
-    fn hides(&self, id: &OpId) -> bool {
-        self.mask.is_some_and(|m| m.hides(id))
-    }
-
-    /// Whether this doc op is visible under the mask snapshot: a stored
-    /// successor only overwrites it if the mask does not hide that
-    /// successor too. The visibility index is built under the mask, so it
-    /// holds the answer.
-    fn masked_visible(&self, doc_op: &Op<'a>) -> bool {
-        self.op_set.indexed_visible(doc_op.pos)
-    }
-
-    fn process_doc_op(&mut self, doc_op: &Op<'a>, effect: SuccessorEffect) {
-        // A hidden doc op is invisible before and after the batch: it enters
-        // neither summary and its mark must not leak into the rich-text diff.
-        if self.hides(&doc_op.id) {
-            return;
-        }
+    fn process_doc_op(&mut self, doc_op: &Op<'a>, deleted: bool) {
         match doc_op.action {
             Action::Increment => {}
             Action::Mark => {
@@ -615,22 +617,25 @@ impl<'a> ValueState<'a> {
                 self.marks.after.process(doc_op.id, doc_op.action());
             }
             _ => {
-                if self.masked_visible(doc_op) {
-                    // OpIter yields stored counter bases, not their current
-                    // totals. Under a mask only un-hidden increments count.
-                    let mut doc_op = doc_op.clone();
-                    doc_op.fix_counter(self.mask.map(Mask::clock));
-                    let mut value = doc_op.hydrate_value(self.text_encoding);
-                    // Before always includes this candidate, even if the batch
-                    // deletes it. Only after gets new counter contributions.
-                    self.before.add_existing(doc_op.id, value.clone());
-                    if !effect.deleted {
-                        if let Value::Scalar(ScalarValue::Counter(c)) = &mut value {
-                            c.increment(effect.increment);
-                        }
-                        self.after.add_existing(doc_op.id, value);
-                    }
+                if doc_op.visible() {
+                    self.doc
+                        .set(doc_op.hydrate_value(self.text_encoding), doc_op.id, deleted);
                 }
+            }
+        }
+    }
+
+    fn do_increment(&mut self, op: &ChangeOp) {
+        if self.change.is_none() {
+            if let Some(id) = self.doc.id() {
+                if op.pred().contains(&id) && !self.doc.is_deleted() {
+                    self.change = self.doc.clone();
+                }
+            }
+        }
+        if let Some(id) = self.change.id() {
+            if op.pred().contains(&id) {
+                self.change.increment(op.value().as_i64());
             }
         }
     }
@@ -644,51 +649,189 @@ impl<'a> ValueState<'a> {
     }
 
     fn process_change_op(&mut self, op: &ChangeOp) {
-        // A masked incoming op is never a candidate and its mark is skipped.
-        if op.masked {
-            return;
-        }
         match op.action() {
-            // Successor lists already supply the complete counter contribution.
-            Action::Delete | Action::Increment => {}
+            Action::Delete => {}
+            Action::Increment => self.do_increment(op),
             Action::Mark => self.process_mark(op.id(), op.mark_data()),
             _ => {
                 if op.visible() {
-                    self.after.add_incoming(
-                        op.id(),
-                        op.hydrate_value_and_fix_counters(self.text_encoding),
-                    );
+                    self.change
+                        .set(op.hydrate_value(self.text_encoding), op.id(), false);
                 }
             }
         }
     }
 
-    fn map_flush(&mut self, log: &mut Events<'_>) {
-        let before = std::mem::take(&mut self.before);
-        let after = std::mem::take(&mut self.after);
+    fn map_flush(&mut self, log: &mut PatchLog) {
+        let obj = self.obj;
+        let change = self.change.take();
+        let doc = self.doc.take();
         if let Some(PropRef::Map(key)) = self.key.take() {
-            ValueTransition::new(before, after).emit_map(self.obj, &key, log);
+            Self::map_process(obj, &key, doc, change, log);
         }
     }
 
-    fn list_flush(&mut self, index: usize, log: &mut Events<'_>) {
+    fn list_flush(&mut self, index: usize, log: &mut PatchLog) {
         if self.key.take().is_none() {
             return;
         }
-        let before = std::mem::take(&mut self.before);
-        let after = std::mem::take(&mut self.after);
-        ValueTransition::new(before, after).emit_sequence(
-            self.obj,
-            index,
-            self.seq_type,
-            self.text_encoding,
-            &self.marks,
-            log,
-        );
+        let obj = self.obj;
+        let encoding = self.seq_type;
+        if encoding == SequenceType::List {
+            match (self.doc.0.take(), self.change.0.take()) {
+                (None, Some(c)) => log.insert(obj, index, c.value, c.id, c.conflict),
+                (Some(d), Some(c)) if d.id == c.id => {
+                    let n = c.value.as_i64() - d.value.as_i64();
+                    if n != 0 {
+                        log.increment_seq(obj, index, n, c.id);
+                    }
+                }
+                (Some(d), Some(c)) if c.id < d.id => {
+                    log.flag_conflict(obj, &Prop::from(index));
+                }
+                (Some(d), Some(c)) => {
+                    let conflict = !d.deleted || c.conflict;
+                    log.put_seq(obj, index, c.value, c.id, conflict, false)
+                }
+                (Some(d), None) => {
+                    if d.expose {
+                        log.put_seq(obj, index, d.value, d.id, d.conflict, true);
+                    } else if d.deleted {
+                        log.delete_seq(obj, index, 1);
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match (self.doc.0.take(), self.change.0.take()) {
+                (None, Some(c)) => {
+                    match c.value {
+                        Value::Scalar(_) => {
+                            // I don't think this branch can ever actually happen in practice. If we
+                            // reach here it's because there is a non-inserting operation (i.e. an
+                            // update) to the operation at `index`, but we only allow insertions
+                            // into text objects. Regardless, we handle this is a splice just in
+                            // case
+                            log.splice(obj, index, c.value.as_str(), self.marks.current().export());
+                        }
+                        _ => log.insert(obj, index, c.value, c.id, c.conflict),
+                    }
+                }
+                (Some(d), Some(c)) if d.deleted => {
+                    // A text update replaces one Automerge sequence element, but that element can
+                    // render as more than one unit in the configured text encoding. Express the
+                    // update as a deletion and insertion so materialized text removes the full
+                    // width of the old value.
+                    log.replace_seq(
+                        obj,
+                        index,
+                        &d.value,
+                        c.value,
+                        c.id,
+                        c.conflict,
+                        false,
+                        self.seq_type,
+                        self.text_encoding,
+                        self.marks.current().export(),
+                    );
+                }
+                (Some(d), Some(c)) if d.id == c.id => {
+                    // Counter increments do not change the rendered text.
+                }
+                (Some(d), Some(c)) if c.id > d.id => {
+                    let conflict = !d.deleted || c.conflict;
+                    log.replace_seq(
+                        obj,
+                        index,
+                        &d.value,
+                        c.value,
+                        c.id,
+                        conflict,
+                        false,
+                        self.seq_type,
+                        self.text_encoding,
+                        self.marks.current().export(),
+                    );
+                }
+                (Some(d), Some(_)) if !d.conflict => {
+                    log.flag_conflict(obj, &Prop::from(index));
+                }
+                (Some(d), None) if d.expose => {
+                    let replaced = d
+                        .replaced
+                        .clone()
+                        .expect("exposed value must record the value it replaces");
+                    log.replace_seq(
+                        obj,
+                        index,
+                        &replaced,
+                        d.value,
+                        d.id,
+                        d.conflict,
+                        true,
+                        self.seq_type,
+                        self.text_encoding,
+                        self.marks.current().export(),
+                    );
+                }
+                (Some(d), None) if d.deleted => {
+                    let w = d.value.width(self.seq_type, self.text_encoding);
+                    log.delete_seq(obj, index, w);
+                }
+                (Some(d), None) => {
+                    if let Some(m) = self.marks.current().export() {
+                        log.mark(
+                            obj,
+                            index,
+                            d.value.width(self.seq_type, self.text_encoding),
+                            &m,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn map_process(
+        obj: ObjId,
+        key: &str,
+        doc: OpValueOption,
+        change: OpValueOption,
+        log: &mut PatchLog,
+    ) {
+        match (doc.into_value(), change.into_value()) {
+            (None, Some(c)) => {
+                log.put_map(obj, key, c.value, c.id, c.conflict, false);
+            }
+            (Some(d), None) => {
+                if d.expose {
+                    log.put_map(obj, key, d.value, d.id, d.conflict, true);
+                } else if d.deleted {
+                    log.delete_map(obj, key);
+                }
+            }
+            (Some(d), Some(c)) if c.id > d.id => {
+                let conflict = (c.conflict && !d.conflict) || !d.deleted;
+                log.put_map(obj, key, c.value, c.id, conflict, false);
+            }
+            (Some(d), Some(c)) if c.id < d.id => {
+                if !d.conflict {
+                    log.flag_conflict(obj, &Prop::from(key));
+                }
+            }
+            (Some(d), Some(c)) if d.id == c.id => {
+                let n = c.value.as_i64() - d.value.as_i64();
+                if n != 0 {
+                    log.increment_map(obj, key, n, c.id);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
-fn walk_map(mw: &mut MapWalker<'_, '_, '_>, change_ops: &mut [ChangeOp]) {
+fn walk_map(mw: &mut MapWalker<'_, '_>, change_ops: &mut [ChangeOp]) {
     for pos in 0..change_ops.len() {
         mw.change_op(change_ops, pos);
     }
@@ -705,43 +848,18 @@ impl BatchApply {
         }
     }
 
-    fn insert_new_actors(&self, doc: &mut Automerge) {
-        // Insert every new actor first: a later insertion would shift the
-        // indices collected for the earlier ones. The second pass is pure
-        // lookup. Registration is bulk: one visibility derivation per batch,
-        // not one per new actor.
+    fn insert_new_actors(&mut self, doc: &mut Automerge) {
         for c in self.changes.iter().filter(|c| c.seq() == 1) {
             doc.put_actor_ref(c.actor_id());
         }
-        let pairs: Vec<_> = self
-            .changes
-            .iter()
-            .filter(|c| c.seq() == 1)
-            .filter_map(|c| {
-                let author = c.author()?.into_owned();
-                Some((author, doc.put_actor_ref(c.actor_id())))
-            })
-            .collect();
-        doc.register_actors(pairs);
     }
 
-    /// Flag every incoming op against the mask snapshot and import it. The
-    /// graph is already up to date; the mask has not moved.
-    fn import_ops(&mut self, doc: &mut Automerge, mask: Option<&Mask>) {
-        let actors_before = doc.ops().actors.len();
+    fn import_ops(&mut self, doc: &mut Automerge) {
         for c in &self.changes {
-            doc.import_ops_to(c, &mut self.ops, mask).unwrap();
+            doc.import_ops_to(c, &mut self.ops).unwrap();
+            doc.update_history(c);
         }
         doc.remove_unused_actors(true);
-        // The mask snapshot and the ops staged above are baked against the
-        // actor indices as of step 3; an actor removal here would silently
-        // invalidate both. Step 4 gave every inserted actor a seq entry, so
-        // this is unreachable — assert it stays that way.
-        debug_assert_eq!(
-            doc.ops().actors.len(),
-            actors_before,
-            "no actor renumbering between the mask snapshot and the walk"
-        );
     }
 
     pub(crate) fn apply(
@@ -749,22 +867,11 @@ impl BatchApply {
         doc: &mut Automerge,
         log: &mut PatchLog,
     ) -> Result<(), PatchLogMismatch> {
-        // Align the batch and log with the incoming doc, taking a snapshot of
-        // the mask before the op set mutation.
-        log.transition_to(doc, |d| d.visible_current())?;
         self.insert_new_actors(doc);
-        doc.assert_mask_derived();
-        let mask0 = doc.mask().cloned();
 
-        // Mark whether a pending boundary has been resolved by any of the
-        // incoming changes. If resolved is true, the mask is published after
-        // the op set is consistent again.
-        let mut resolved = false;
-        for c in &self.changes {
-            resolved |= matches!(doc.update_history(c), HistoryUpdate::BoundaryResolved);
-        }
+        log.migrate_actors(&doc.ops().actors)?;
 
-        self.import_ops(doc, mask0.as_ref());
+        self.import_ops(doc);
 
         let mut obj_info = doc.ops().obj_info.clone();
 
@@ -772,69 +879,46 @@ impl BatchApply {
 
         let mut succ = vec![];
 
+        let mut walker = ObjWalker::new(doc.ops());
+
         let mut conflicts = vec![];
 
-        // The walk records the batch's events and moves the observed view past
-        // it in one operation. That view only depends on the change graph and
-        // the mask (`mask0`), so computing it here — before the deferred op-set
-        // mutations below — names the same view as after them. The transition
-        // above already aligned the log with the pre-insertion actors, so
-        // migrating onto the superset of actors cannot fail.
-        {
-            let ops = &mut self.ops;
-            let pred = &mut self.pred;
-            let obj_spans = &self.obj_spans;
-            let succ = &mut succ;
-            let conflicts = &mut conflicts;
-            log.record(
-                doc,
-                |log| {
-                    let mut walker = ObjWalker::new(doc.ops());
-                    for os in obj_spans {
-                        let obj_range = walker.seek_to_obj(os.obj);
-                        let doc_ops = doc.ops().iter_range(&obj_range);
-                        match obj_info.object_type(&os.obj) {
-                            Some(ObjType::Map) => {
-                                let value = ValueState::new(
-                                    os.obj,
-                                    SequenceType::List,
-                                    doc.text_encoding(),
-                                    mask0.as_ref(),
-                                    doc.ops(),
-                                );
-                                let mut walker =
-                                    MapWalker::new(value, doc_ops, pred, succ, log, conflicts);
-                                let change_ops = &mut ops[os.span.clone()];
-                                walk_map(&mut walker, change_ops);
-                            }
-                            Some(otype) if otype.is_sequence() => {
-                                let sequence_type = match otype {
-                                    ObjType::Text => SequenceType::Text,
-                                    ObjType::List => SequenceType::List,
-                                    _ => unreachable!(),
-                                };
-                                let value = ValueState::new(
-                                    os.obj,
-                                    sequence_type,
-                                    doc.text_encoding(),
-                                    mask0.as_ref(),
-                                    doc.ops(),
-                                );
-                                let ut = Untangler::new(
-                                    value,
-                                    conflicts,
-                                    &mut ops[os.span.clone()],
-                                    pred,
-                                    doc_ops.end_pos(),
-                                );
-                                walk_list(ut, doc_ops, succ, log);
-                            }
-                            _ => panic!("Obj {:?} Missing from Index", os.obj),
-                        }
-                    }
-                },
-                |d| d.visible_current(),
-            )?;
+        for os in &self.obj_spans {
+            let obj_range = walker.seek_to_obj(os.obj);
+            let doc_ops = doc.ops().iter_range(&obj_range);
+            match obj_info.object_type(&os.obj) {
+                Some(ObjType::Map) => {
+                    let mut walker = MapWalker::new(
+                        os.obj,
+                        doc_ops,
+                        doc.text_encoding(),
+                        &mut self.pred,
+                        &mut succ,
+                        log,
+                        &mut conflicts,
+                    );
+                    let change_ops = &mut self.ops[os.span.clone()];
+                    walk_map(&mut walker, change_ops);
+                }
+                Some(otype) if otype.is_sequence() => {
+                    let sequence_type = match otype {
+                        ObjType::Text => SequenceType::Text,
+                        ObjType::List => SequenceType::List,
+                        _ => unreachable!(),
+                    };
+                    let ut = Untangler::new(
+                        os.obj,
+                        sequence_type,
+                        doc.text_encoding(),
+                        &mut conflicts,
+                        &mut self.ops[os.span.clone()],
+                        &mut self.pred,
+                        doc_ops.end_pos(),
+                    );
+                    walk_list(ut, doc_ops, &mut succ, log);
+                }
+                _ => panic!("Obj {:?} Missing from Index", os.obj),
+            }
         }
 
         #[cfg(feature = "slow_path_assertions")]
@@ -861,13 +945,6 @@ impl BatchApply {
         doc.ops.add_succ(&succ);
 
         self.insert_runs_of_ops(doc);
-
-        // If the batch witnessed a pending write-frontier boundary, publish the
-        // mask change once, as its own visibility transition between two
-        // internally consistent op-set states.
-        if resolved {
-            doc.republish_mask(log, |_| {})?;
-        }
 
         debug_assert!(doc.ops.validate_op_order());
         Ok(())
@@ -912,11 +989,10 @@ impl BatchApply {
         let mut last_obj = None;
         for (i, o) in self.ops.iter().enumerate() {
             for p in o.pred().iter() {
-                self.pred.entry(*p).or_default().push(SuccessorValue::new(
-                    o.id(),
-                    o.get_increment_value(),
-                    o.masked,
-                ))
+                self.pred
+                    .entry(*p)
+                    .or_default()
+                    .push((o.id(), o.get_increment_value()));
             }
             if let Some(info) = o.obj_info() {
                 obj_info.insert(o.id(), info)
@@ -974,14 +1050,6 @@ impl Automerge {
         changes: I,
         log: &mut PatchLog,
     ) -> Result<(), AutomergeError> {
-        // Validate the observer before any change is taken from the queue: a
-        // rejected log must leave previously queued changes available for a
-        // retry with a compatible log. `validate` is read-only, and once it
-        // passes the migrations inside `BatchApply::apply` cannot fail:
-        // applying a batch only *adds* actors, and migrating onto a superset
-        // of the log's actors always succeeds.
-        log.validate(&self.ops.actors)?;
-
         let mut seen: HashSet<ChangeHash> = self.queue.iter().map(Change::hash).collect();
         let mut actor_seqs: HashMap<ActorId, HashSet<u64>> = HashMap::new();
         let mut actor_author: HashSet<ActorId> = HashSet::new();
@@ -1020,9 +1088,6 @@ impl Automerge {
             {
                 return Err(AutomergeError::duplicate_author(&change));
             }
-            if change.author().is_some() && change.seq() != 1 {
-                return Err(AutomergeError::author_on_non_initial_seq(&change));
-            }
 
             seen.insert(hash);
             actor_seqs
@@ -1044,18 +1109,13 @@ impl Automerge {
         &mut self,
         change: &Change,
         ops: &mut Vec<ChangeOp>,
-        mask: Option<&Mask>,
     ) -> Result<(), AutomergeError> {
-        let new_ops = self.import_ops(change, mask)?;
+        let new_ops = self.import_ops(change)?;
         ops.extend(new_ops);
         Ok(())
     }
 
-    fn import_ops(
-        &mut self,
-        change: &Change,
-        mask: Option<&Mask>,
-    ) -> Result<Vec<ChangeOp>, AutomergeError> {
+    fn import_ops(&mut self, change: &Change) -> Result<Vec<ChangeOp>, AutomergeError> {
         let actors: Vec<_> = change
             .actors()
             .map(|a| self.ops.lookup_actor(a).unwrap())
@@ -1089,9 +1149,6 @@ impl Automerge {
                     subsort: 0,
                     conflicted: false,
                     succ: vec![],
-                    // The invariant fact for this batch: hidden by the mask
-                    // snapshot taken before the graph was updated.
-                    masked: mask.is_some_and(|m| m.hides(&id)),
                     bld,
                 };
                 Ok(change)
@@ -1980,22 +2037,5 @@ mod tests {
 
             doc.validate_top_index();
         }
-    }
-
-    #[test]
-    fn batch_multiple_changes_same_author() {
-        let author = crate::Author::try_from("aabbccdd").unwrap();
-        let mut doc1 = AutoCommit::new().with_author(Some(author.clone()));
-        doc1.put(&ROOT, "key1", "value1").unwrap();
-        doc1.commit();
-        doc1.put(&ROOT, "key2", "value2").unwrap();
-        doc1.commit();
-
-        let heads0 = [];
-        let changes = doc1.get_changes(&heads0);
-        assert_eq!(changes.len(), 2);
-
-        let mut doc2 = AutoCommit::new();
-        doc2.apply_changes_batch(changes).unwrap();
     }
 }

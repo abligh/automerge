@@ -1,4 +1,4 @@
-use crate::{exid::ExId, types};
+use crate::{exid::ExId, types, types::Clock};
 
 use crate::op_set2::op_set::OpQueryTerm;
 use crate::op_set2::OpSet;
@@ -11,7 +11,12 @@ pub struct Values<'a> {
 }
 
 impl<'a> Values<'a> {
-    pub(crate) fn new<I: OpQueryTerm<'a> + 'a>(op_set: &'a OpSet, iter: I) -> Self {
+    // FIXME - ignore clock?
+    pub(crate) fn new<I: OpQueryTerm<'a> + 'a>(
+        op_set: &'a OpSet,
+        iter: I,
+        _clock: Option<Clock>,
+    ) -> Self {
         Self {
             iter: Some((op_set, Box::new(iter))),
         }

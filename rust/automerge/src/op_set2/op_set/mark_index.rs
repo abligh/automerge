@@ -1,4 +1,3 @@
-use crate::actor::{ActorRefs, ActorRemoval, ActorShift, HasActorIndices};
 use crate::op_set2::op_set::RichTextQueryState;
 use crate::op_set2::MarkData;
 use crate::types::{Clock, OpId};
@@ -51,21 +50,12 @@ impl MarkIdx {
             Self::Start(OpId::new(ctr, actor))
         }
     }
-}
 
-impl HasActorIndices for MarkIdx {
-    fn shifted(self, shift: &ActorShift) -> Self {
+    pub(super) fn with_new_actor(self, idx: usize) -> Self {
         match self {
-            Self::Start(id) => Self::Start(id.shifted(shift)),
-            Self::End(id) => Self::End(id.shifted(shift)),
+            Self::Start(id) => Self::Start(id.with_new_actor(idx)),
+            Self::End(id) => Self::End(id.with_new_actor(idx)),
         }
-    }
-
-    fn removed(self, removal: &ActorRemoval) -> Option<Self> {
-        Some(match self {
-            Self::Start(id) => Self::Start(id.removed(removal)?),
-            Self::End(id) => Self::End(id.removed(removal)?),
-        })
     }
 }
 
@@ -223,14 +213,14 @@ impl PrefixValue for MarkIdx {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MarkIndexColumn {
     data: PrefixColumn<Option<MarkIdx>>,
-    cache: ActorRefs<HashMap<OpId, MarkData<'static>>>,
+    cache: HashMap<OpId, MarkData<'static>>,
 }
 
 impl MarkIndexColumn {
     pub(crate) fn new() -> Self {
         Self {
             data: PrefixColumn::new(),
-            cache: ActorRefs::default(),
+            cache: HashMap::new(),
         }
     }
 
@@ -259,9 +249,13 @@ impl MarkIndexColumn {
         self.cache.get(id)
     }
 
-    pub(crate) fn shift(&mut self, shift: &ActorShift) {
-        self.remap_values(|m| m.shifted(shift));
-        self.cache.shift_actors(shift);
+    pub(crate) fn rewrite_with_new_actor(&mut self, idx: usize) {
+        self.remap_values(|m| m.with_new_actor(idx));
+        self.cache = self
+            .cache
+            .iter()
+            .map(|(key, val)| (key.with_new_actor(idx), val.clone()))
+            .collect();
     }
 
     /// Rebuild the data column with `f` applied to every mark idx —

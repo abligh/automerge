@@ -59,7 +59,7 @@ impl<'a> InsertQuery<'a> {
     // op.succ(maybe)   //
     //------------------//
 
-    fn identify_valid_insertion_spot(&mut self, op: &Op<'a>, cursor: ElemId, visible: bool) {
+    fn identify_valid_insertion_spot(&mut self, op: &Op<'a>, cursor: ElemId) {
         // first insert we see after list_state.done()
         if op.insert && self.candidates.is_empty() {
             if let Some(cursor) = self.last_visible_cursor {
@@ -67,12 +67,8 @@ impl<'a> InsertQuery<'a> {
             }
         }
 
-        // sticky marks: only visible mark ops attract the insertion point.
-        // A mark hidden by the clock — a masked author or an
-        // isolation scope that does not cover it — must not move the
-        // insert past its boundary; the indexed fast path already excludes
-        // such marks because the indexes are rebuilt under the mask.
-        if visible && !self.candidates.is_empty() {
+        // sticky marks
+        if !self.candidates.is_empty() {
             // if we find a begin/end pair - ignore them
             if let OpType::MarkEnd(_) = op.action() {
                 if let Some(pos) = self.candidates.iter().position(|loc| loc.matches(op)) {
@@ -114,7 +110,7 @@ impl<'a> InsertQuery<'a> {
             }
             let cursor = op.cursor().unwrap();
             if done {
-                self.identify_valid_insertion_spot(&op, cursor, visible);
+                self.identify_valid_insertion_spot(&op, cursor);
                 if visible {
                     if op.action == Action::Mark {
                         post_marks.push(op);

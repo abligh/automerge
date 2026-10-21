@@ -1,5 +1,3 @@
-use crate::actor::{ActorRefs, ActorRemoval, ActorShift, HasActorIndices};
-use crate::clock::Clock;
 use crate::op_set2::op_set::{MarkIndexBuilder, MarkIndexColumn};
 use crate::op_set2::{ChangeOp, Op, OpBuilder, OpSet};
 use crate::types::{ObjId, ObjType, OpId, SequenceType, TextEncoding};
@@ -77,7 +75,7 @@ impl MarkOrderValidator {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct ObjIndex(pub(crate) ActorRefs<HashMap<OpId, ObjInfo>>);
+pub(crate) struct ObjIndex(pub(crate) HashMap<OpId, ObjInfo>);
 
 impl ObjIndex {
     pub(crate) fn object_type(&self, obj: &ObjId) -> Option<ObjType> {
@@ -111,17 +109,17 @@ pub(crate) struct ObjInfo {
     pub(crate) obj_type: ObjType,
 }
 
-impl HasActorIndices for ObjInfo {
-    fn shifted(self, shift: &ActorShift) -> Self {
+impl ObjInfo {
+    pub(crate) fn with_new_actor(self, idx: usize) -> Self {
         Self {
-            parent: self.parent.shifted(shift),
+            parent: self.parent.with_new_actor(idx),
             obj_type: self.obj_type,
         }
     }
 
-    fn removed(self, removal: &ActorRemoval) -> Option<Self> {
+    pub(crate) fn without_actor(self, idx: usize) -> Option<Self> {
         Some(Self {
-            parent: self.parent.removed(removal)?,
+            parent: self.parent.without_actor(idx)?,
             obj_type: self.obj_type,
         })
     }
@@ -184,29 +182,14 @@ impl IndexBuilder {
         }
         self.last_flush = len;
     }
-
-    /// Add `op` and its successors to the indexes being built.
-    ///
-    /// When `clock` is `None`, all operations are included. Otherwise, only
-    /// covered operations contribute to visibility: uncovered successors do
-    /// not hide values, and uncovered increments do not affect counter values.
-    ///
-    /// Mark ordering is validated and object and successor metadata are
-    /// recorded regardless of coverage. Marks outside the clock are omitted
-    /// from the mark index.
-    ///
-    /// Call [`Self::flush`] between registers. Successor indexing is handled
-    /// here, that is, callers must not also call [`Self::process_succ`] for
-    /// this op.
-    pub(crate) fn process_op(&mut self, op: &Op<'_>, clock: Option<&Clock>) {
-        let visible = clock.is_none_or(|clock| clock.covers(&op.id));
-
+    pub(crate) fn process_op(&mut self, op: &Op<'_>) {
         let mark_index = op.mark_index();
         self.mark_order.process_mark_index(op, &mark_index);
-        self.marks.push(if visible { mark_index } else { None });
+        self.marks.push(mark_index);
 
-        self.succ.push(vis_num(op, clock));
+        self.succ.push(vis_num(op));
         self.top.push(false);
+
         self.widths
             .push(op.width(SequenceType::Text, self.text_encoding) as u64);
 
@@ -215,18 +198,12 @@ impl IndexBuilder {
         if let Some(i) = op.get_increment_value() {
             for (succ_idx, op_idx) in count.into_iter().flatten() {
                 self.incs[succ_idx] = Some(i);
-                if visible {
-                    self.succ[op_idx] -= 1;
-                }
+                self.succ[op_idx] -= 1;
             }
         }
 
         if let Some(obj_info) = op.obj_info() {
             self.obj_info.insert(op.id, obj_info);
-        }
-
-        for succ_id in op.succ() {
-            self.process_succ(op.is_counter(), succ_id);
         }
     }
 
@@ -277,14 +254,10 @@ impl IndexBuilder {
     }
 }
 
-fn vis_num(op: &Op<'_>, clock: Option<&Clock>) -> u32 {
+fn vis_num(op: &Op<'_>) -> u32 {
     if op.is_inc() {
-        return u32::MAX;
-    }
-
-    match clock {
-        None => op.succ().len() as u32,
-        Some(clock) if !clock.covers(&op.id) => u32::MAX,
-        Some(clock) => op.succ().filter(|id| clock.covers(id)).count() as u32,
+        u32::MAX
+    } else {
+        op.succ().len() as u32
     }
 }

@@ -5,8 +5,6 @@ mod owned_transaction;
 mod result;
 mod transactable;
 
-use crate::automerge::HistoryUpdate;
-
 pub use self::commit::CommitOptions;
 pub use self::transactable::{BlockOrText, Transactable};
 pub(crate) use inner::{TransactionArgs, TransactionInner};
@@ -24,50 +22,12 @@ fn commit_transaction(
     options: CommitOptions,
 ) -> Option<crate::ChangeHash> {
     let historical_heads = tx.get_scope().as_ref().map(|_| tx.get_deps());
-    let (hash, history) = match tx.commit(doc, options.message, options.time) {
-        Some((hash, history)) => (Some(hash), history),
-        None => (None, HistoryUpdate::Unchanged),
-    };
-    let heads = match historical_heads {
-        Some(heads) => hash.map_or(heads, |hash| vec![hash]),
-        None => doc.get_heads(),
-    };
-    patch_log.finish_transaction(doc, |d| d.visible(&heads));
-    if let HistoryUpdate::BoundaryResolved = history {
-        // The commit's op-set mutation is complete and the log's view has
-        // moved past it, so the mask may now change: publish the resolved
-        // boundary's visibility with a fresh log and let this transaction's
-        // log observe it as a diff at its own (possibly scoped) view.
-        doc.republish_mask(&mut crate::PatchLog::inactive(), |_| {})
-            .expect("a fresh patch log belongs to any document");
-        // The log passed `begin_transaction`, and `finish_transaction` has
-        // just realigned it with the document's actors, so this cannot
-        // mismatch.
-        patch_log
-            .transition_to(doc, |d| d.visible(&heads))
-            .expect("a log that began this transaction is aligned with its document");
+    let hash = tx.commit(doc, options.message, options.time);
+    if let Some(heads) = historical_heads {
+        patch_log.heads = Some(hash.map_or(heads, |hash| vec![hash]));
     }
+    patch_log.finish_transaction(&doc.ops().actors);
     hash
-}
-
-fn get_scope<'a>(
-    doc: &'a crate::Automerge,
-    inner: Option<&'a TransactionInner>,
-    heads: Option<&[crate::ChangeHash]>,
-) -> crate::automerge::view::ReadAt<'a> {
-    use std::borrow::Cow;
-
-    if let Some(h) = heads {
-        // a transaction is in flight: its pending ops are in the op set
-        // but not under the graph's heads, so the current-heads
-        // shortcut in `read_at` would wrongly expose them
-        doc.read_scoped(Cow::Owned(doc.visible(h)))
-    } else {
-        inner.and_then(|i| i.get_scope().as_ref()).map_or_else(
-            || doc.read_current(),
-            |scope| doc.read_scoped(Cow::Borrowed(scope)),
-        )
-    }
 }
 
 /// Generate a `ReadDoc` impl for `Transaction` and `OwnedTransaction`, which are expected to
@@ -265,10 +225,7 @@ macro_rules! impl_read_doc_for_tx {
                 obj: O,
                 heads: Option<&[crate::ChangeHash]>,
             ) -> Result<crate::hydrate::Value, crate::AutomergeError> {
-                // Use the transaction read scope to correctly handle isolated
-                // views, and not the `doc`'s scope.
-                self.doc
-                    .hydrate_obj_for(obj.as_ref(), self.get_scope(heads))
+                self.doc.hydrate_obj(obj.as_ref(), heads)
             }
 
             fn get_marks<O: AsRef<crate::exid::ExId>>(
@@ -353,8 +310,6 @@ macro_rules! impl_read_doc_for_tx {
         }
     };
 }
-
-pub(crate) use impl_read_doc_for_tx;
 
 /// Generate a `Transactable` impl for `Transaction` and `OwnedTransaction`, which are expected
 /// to have `inner: Option<TransactionInner>` and a `do_tx` method.
@@ -568,4 +523,6 @@ macro_rules! impl_transactable_for_tx {
         }
     };
 }
+
+pub(crate) use impl_read_doc_for_tx;
 pub(crate) use impl_transactable_for_tx;

@@ -2,13 +2,12 @@ use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use crate::actor::ActorList;
 use crate::op_set2::change::ChangeCollector;
 use crate::storage::change::{OpReadState, Unverified, Verified};
 use crate::storage::columns::compression;
 use crate::storage::columns::{ColumnId, ColumnType};
 use crate::storage::{parse, Header, RawColumns};
-use crate::types::ChangeHash;
+use crate::types::{ActorId, ChangeHash};
 use crate::Change;
 
 use super::{BundleChangeIter, BundleChangeIterUnverified, OpIter, OpIterUnverified, ParseError};
@@ -32,7 +31,7 @@ pub(crate) struct BundleStorage<'a, OpReadState> {
     pub(crate) compressed_bytes: Option<Cow<'a, [u8]>>,
     pub(crate) header: Header,
     pub(crate) deps: Vec<ChangeHash>,
-    pub(crate) actors: ActorList,
+    pub(crate) actors: Vec<ActorId>,
     pub(crate) ops_meta: RawColumns<compression::Uncompressed>,
     pub(crate) ops_data: Range<usize>,
     pub(crate) changes_meta: RawColumns<compression::Uncompressed>,
@@ -163,7 +162,7 @@ impl<'a> BundleStorage<'a, Unverified> {
             |i| -> parse::ParseResult<'_, _, ParseError> {
                 let (i, deps) = parse::length_prefixed(parse::change_hash)(i)?;
                 let (i, actors) = parse::length_prefixed(parse::actor_id)(i)?;
-                Ok((i, (deps, ActorList::from_stored(actors))))
+                Ok((i, (deps, actors)))
             },
             input,
         )?;
@@ -308,14 +307,13 @@ impl<'a> BundleStorage<'a, Unverified> {
 
 impl BundleStorage<'_, Verified> {
     pub(crate) fn to_changes(&self) -> Result<Vec<Change>, ParseError> {
-        let actors = self.actors.clone().into_table()?;
         let change_meta = self.iter_change_meta().collect();
-        let mut collector = ChangeCollector::from_bundle_changes(change_meta, &actors);
+        let mut collector = ChangeCollector::from_bundle_changes(change_meta, &self.actors);
         for op in self.iter_ops() {
             collector.add(op);
         }
         let bundle = collector
-            .unbundle(&actors, &self.deps)
+            .unbundle(&self.actors, &self.deps)
             .map_err(|e| ParseError::Unbundle(Box::new(e)))?;
         Ok(bundle)
     }

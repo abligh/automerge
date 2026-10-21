@@ -2,12 +2,11 @@ use core::fmt::Debug;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::automerge::view::ReadAt;
 use crate::exid::ExId;
 use crate::iter::SpanInternal;
 use crate::marks::MarkSet;
 use crate::text_value::ConcreteTextValue;
-use crate::types::{ObjId, ObjType};
+use crate::types::{Clock, ObjId, ObjType};
 use crate::{Automerge, Prop, TextEncoding, Value};
 
 use super::{Event, Patch, PatchAction};
@@ -20,7 +19,7 @@ pub(crate) struct PatchBuilder<'a> {
     path_map: BTreeMap<ObjId, (Prop, ObjId)>,
     seen: HashSet<ObjId>,
     text_encoding: TextEncoding,
-    read: ReadAt<'a>,
+    clock: Option<Clock>,
     doc: &'a Automerge,
 }
 
@@ -28,7 +27,7 @@ impl<'a> PatchBuilder<'a> {
     pub(crate) fn new(
         doc: &'a Automerge,
         path_map: BTreeMap<ObjId, (Prop, ObjId)>,
-        read: ReadAt<'a>,
+        clock: Option<Clock>,
         text_encoding: TextEncoding,
     ) -> Self {
         // If we are expecting a lot of patches then precompute all the visible
@@ -40,7 +39,7 @@ impl<'a> PatchBuilder<'a> {
             path_map,
             seen: HashSet::new(),
             doc,
-            read,
+            clock,
             text_encoding,
         }
     }
@@ -113,7 +112,7 @@ impl PatchBuilder<'_> {
     fn update_path_map(&mut self, parent_id: ObjId, parent_type: ObjType) {
         match parent_type {
             ObjType::List => {
-                for item in self.doc.ops.list_range(&parent_id, .., self.read.borrow()) {
+                for item in self.doc.ops.list_range(&parent_id, .., self.clock.clone()) {
                     if item.value.is_object() {
                         let prop = Prop::from(item.index);
                         self.path_map.insert(ObjId(item.op_id()), (prop, parent_id));
@@ -121,7 +120,7 @@ impl PatchBuilder<'_> {
                 }
             }
             ObjType::Text => {
-                for span in self.doc.ops.spans(&parent_id, self.read.borrow()) {
+                for span in self.doc.ops.spans(&parent_id, self.clock.clone()) {
                     if let SpanInternal::Obj(id, index, _) = span {
                         let prop = Prop::from(index);
                         self.path_map.insert(ObjId(id), (prop, parent_id));
@@ -129,7 +128,7 @@ impl PatchBuilder<'_> {
                 }
             }
             _ => {
-                for item in self.doc.ops.map_range(&parent_id, .., self.read.borrow()) {
+                for item in self.doc.ops.map_range(&parent_id, .., self.clock.clone()) {
                     if item.value.is_object() {
                         self.path_map.insert(
                             ObjId(item.op_id()),

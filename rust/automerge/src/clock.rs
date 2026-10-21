@@ -1,66 +1,49 @@
-use crate::actor::{ActorIndexed, ActorRemoval, ActorShift, ActorTable};
 use crate::types::OpId;
 
 use std::num::NonZeroU32;
 
 /// A [`Clock`] is a vector clock for a set of actors.
 ///
-/// Each slot holds the greatest op counter seen for that actor.
+/// Each index of the vector represents that actors counter.
 ///
 /// For example, given an [`OpId`], one can use [`OpId::actor`] to find the
 /// currently stored counter of the actor in the [`Clock`].
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Clock(ActorIndexed<u32>);
+#[derive(Default, Debug, Clone, PartialEq)]
+pub(crate) struct Clock(pub(crate) Vec<u32>);
 
-/// A vector clock over change *sequence numbers*: each slot holds the
-/// greatest `seq` seen for that actor, or `None` if none has.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SeqClock(ActorIndexed<Option<NonZeroU32>>);
+#[derive(Default, Debug, Clone, PartialEq)]
+pub(crate) struct SeqClock(pub(crate) Vec<Option<NonZeroU32>>);
 
 impl SeqClock {
-    pub(crate) fn remove_actor(&mut self, removal: &ActorRemoval) {
-        self.0.remove(removal);
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, Option<NonZeroU32>)> + '_ {
+        self.0.iter().copied().enumerate()
     }
 
-    pub(crate) fn shift_actor(&mut self, shift: &ActorShift) {
-        self.0.insert(shift, None)
+    pub(crate) fn remove_actor(&mut self, idx: usize) {
+        self.0.remove(idx);
+    }
+
+    pub(crate) fn rewrite_with_new_actor(&mut self, idx: usize) {
+        self.0.insert(idx, None)
     }
 
     pub(crate) fn get_for_actor(&self, actor_index: &usize) -> Option<NonZeroU32> {
         self.0.get(*actor_index).copied().flatten()
     }
 
-    /// An empty clock with a slot for every actor in `actors`.
-    pub(crate) fn new(actors: &ActorTable) -> Self {
-        Self(ActorIndexed::new(actors))
-    }
-
-    /// An empty clock covering the same actors as `self`.
-    pub(crate) fn empty_like(&self) -> Self {
-        Self(ActorIndexed::new_like(&self.0))
-    }
-
-    /// Derive a [`Clock`] over the same actors, mapping each actor's `seq`
-    /// to an op counter with `f`.
-    pub(crate) fn map_to_clock(
-        &self,
-        mut f: impl FnMut(usize, NonZeroU32) -> Option<u32>,
-    ) -> Clock {
-        Clock(ActorIndexed::from_slots_of(&self.0, |actor, seq| {
-            seq.and_then(|seq| f(actor, seq)).unwrap_or(0)
-        }))
+    pub(crate) fn new(size: usize) -> Self {
+        Self(vec![None; size])
     }
 
     pub(crate) fn include(&mut self, actor_idx: usize, data: Option<u32>) -> bool {
         if let Some(data) = data {
-            let slots = self.0.as_mut_slice();
-            match slots[actor_idx] {
+            match self.0[actor_idx] {
                 None => {
-                    slots[actor_idx] = NonZeroU32::try_from(data).ok();
+                    self.0[actor_idx] = NonZeroU32::try_from(data).ok();
                     true
                 }
                 Some(old_data) if old_data.get() < data => {
-                    slots[actor_idx] = NonZeroU32::try_from(data).ok();
+                    self.0[actor_idx] = NonZeroU32::try_from(data).ok();
                     true
                 }
                 _ => false,
@@ -71,7 +54,7 @@ impl SeqClock {
     }
 
     pub(crate) fn merge(a: &mut Self, b: &Self) {
-        for (a, b) in std::iter::zip(a.0.as_mut_slice().iter_mut(), b.0.iter()) {
+        for (a, b) in std::iter::zip(a.0.iter_mut(), b.0.iter()) {
             if *a < *b {
                 *a = *b;
             }
@@ -88,53 +71,54 @@ impl SeqClock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ClockRange {
+    Current(Option<Clock>),
+    Diff(Clock, Clock),
+}
+
+impl Default for ClockRange {
+    fn default() -> Self {
+        Self::Current(None)
+    }
+}
+
+impl ClockRange {
+    pub(crate) fn current(clock: Option<Clock>) -> Self {
+        Self::Current(clock)
+    }
+
+    pub(crate) fn after(&self) -> Option<&Clock> {
+        match self {
+            Self::Diff(_, after) => Some(after),
+            Self::Current(Some(after)) => Some(after),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn visible_after(&self, id: &OpId) -> bool {
+        match self {
+            Self::Current(Some(after)) => after.covers(id),
+            Self::Diff(_, after) => after.covers(id),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn visible_before(&self, id: &OpId) -> bool {
+        self.predates(id)
+    }
+
+    pub(crate) fn predates(&self, id: &OpId) -> bool {
+        match self {
+            Self::Diff(before, _) => before.covers(id),
+            _ => false,
+        }
+    }
+}
+
 impl Clock {
-    /// Construct a clock with one counter per actor in `actors`.
-    pub(crate) fn from_actor_fn(actors: &ActorTable, counter: impl FnMut(usize) -> u32) -> Self {
-        Self(ActorIndexed::build_from(actors, counter))
-    }
-
-    pub(crate) fn remove_actor(&mut self, removal: &ActorRemoval) {
-        self.0.remove(removal);
-    }
-
-    pub(crate) fn insert_actor(&mut self, shift: &ActorShift, counter: u32) {
-        self.0.insert(shift, counter)
-    }
-
-    /// Counters in actor-table order.
-    pub(crate) fn counters(&self) -> impl Iterator<Item = u32> + '_ {
-        self.0.iter().copied()
-    }
-
-    /// Number of actors this clock covers.
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// An empty clock covering the same actors as `self`.
-    pub(crate) fn empty_like(&self) -> Self {
-        Self(ActorIndexed::new_like(&self.0))
-    }
-
-    /// Returns `true` if any operation is covered.
-    pub(crate) fn covers_something(&self) -> bool {
-        self.0.iter().any(|counter| *counter > 0)
-    }
-
     pub(crate) fn isolate(&mut self, actor_index: usize) {
         self.set_counter_of(actor_index, u32::MAX);
-    }
-
-    /// Get the minimum bound intersection of two [`Clock`]s.
-    ///
-    /// # Panics
-    ///
-    /// If the size of both [`Clock`]s are not equal.
-    pub(crate) fn intersect(&mut self, other: &Self) {
-        for (counter, bound) in self.0.zip_mut(&other.0) {
-            *counter = (*counter).min(*bound);
-        }
     }
 
     /// An [`OpId`] is covered by a [`Clock`] if the operation happened within
@@ -168,16 +152,13 @@ impl Clock {
     /// If the `actor` index is out of bounds of the internal vector.
     #[inline]
     fn set_counter_of(&mut self, actor: usize, counter: u32) {
-        self.0.as_mut_slice()[actor] = counter;
+        self.0[actor] = counter;
     }
+}
 
-    /// A clock from explicit per-actor counters, for tests which model the
-    /// actor table implicitly.
-    #[cfg(test)]
-    pub(crate) fn from_counters(counters: impl IntoIterator<Item = Option<u32>>) -> Self {
-        Clock(ActorIndexed::from_slots_for_test(
-            counters.into_iter().map(|c| c.unwrap_or(0)).collect(),
-        ))
+impl std::iter::FromIterator<Option<u32>> for Clock {
+    fn from_iter<I: IntoIterator<Item = Option<u32>>>(iter: I) -> Self {
+        Clock(iter.into_iter().map(|i| i.unwrap_or(0)).collect())
     }
 }
 
@@ -188,12 +169,12 @@ mod tests {
 
     impl Clock {
         pub(crate) fn new(size: usize) -> Self {
-            Self::from_counters(std::iter::repeat_n(None, size))
+            Self(vec![0; size])
         }
 
         pub(crate) fn include(&mut self, actor_idx: usize, data: u32) -> bool {
             if data > self.0[actor_idx] {
-                self.0.as_mut_slice()[actor_idx] = data;
+                self.0[actor_idx] = data;
                 true
             } else {
                 false

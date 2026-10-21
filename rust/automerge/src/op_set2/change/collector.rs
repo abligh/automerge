@@ -11,7 +11,6 @@ use super::super::ValueMeta;
 use super::{length_prefixed_bytes, shift_range};
 use super::{ActorMapper, ChangeOpsColumns};
 
-use crate::actor::ActorTable;
 use crate::author::Authors;
 use crate::change_graph::{ChangeGraph, ChangeGraphCols};
 use crate::error::AutomergeError;
@@ -42,11 +41,13 @@ impl<'a> IndexedChangeCollector<'a> {
 
         while let Some(op) = iter.try_next()? {
             let op_id = op.id;
+            let op_is_counter = op.is_counter();
             let op_succ = op.succ();
 
             self.process_op(op);
 
             for id in op_succ {
+                self.index.process_succ(op_is_counter, id);
                 self.collector.process_succ(op_id, id);
             }
         }
@@ -63,7 +64,7 @@ impl<'a> IndexedChangeCollector<'a> {
         if flush {
             self.index.flush();
         }
-        self.index.process_op(&op, None);
+        self.index.process_op(&op);
         self.collector.process_op_internal(op, flush);
         if flush {
             self.collector.last = next;
@@ -603,7 +604,7 @@ impl<'a> ChangeCollector<'a> {
 
     pub(crate) fn from_bundle_changes(
         changes: Vec<BundleChange<'a>>,
-        actors: &'a ActorTable,
+        actors: &'a [ActorId],
     ) -> ChangeCollector<'a> {
         let changes = changes.into_iter().map(|c| c.into()).collect();
         Self::from_change_meta(changes, actors)
@@ -611,7 +612,7 @@ impl<'a> ChangeCollector<'a> {
 
     pub(crate) fn try_from_change_meta(
         mut changes: Vec<BuildChangeMetadata<'a>>,
-        actors: &'a ActorTable,
+        actors: &'a [ActorId],
     ) -> Result<ChangeCollector<'a>, OutOfMemory> {
         let mut builders = Vec::new();
         builders
@@ -647,7 +648,7 @@ impl<'a> ChangeCollector<'a> {
 
     pub(crate) fn from_change_meta(
         changes: Vec<BuildChangeMetadata<'a>>,
-        actors: &'a ActorTable,
+        actors: &'a [ActorId],
     ) -> ChangeCollector<'a> {
         Self::try_from_change_meta(changes, actors).unwrap()
     }
@@ -882,7 +883,7 @@ impl<'a> ChangeCollector<'a> {
 
     pub(crate) fn unbundle(
         mut self,
-        actors: &ActorTable,
+        actors: &[ActorId],
         deps: &[ChangeHash],
     ) -> Result<Vec<Change>, Error> {
         let num_actors = actors.len();
