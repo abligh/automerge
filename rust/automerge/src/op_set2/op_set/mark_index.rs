@@ -224,6 +224,22 @@ impl MarkIndexColumn {
         }
     }
 
+    /// The index of ops whose marks `values` gives, in order.
+    pub(crate) fn from_builders(values: impl Iterator<Item = Option<MarkIndexBuilder>>) -> Self {
+        let mut cache = HashMap::new();
+        let column = super::stream_column(values.map(|v| match v? {
+            MarkIndexBuilder::Start(id, mark) => {
+                cache.insert(id, mark);
+                Some(MarkIdx::Start(id))
+            }
+            MarkIndexBuilder::End(id) => Some(MarkIdx::End(id)),
+        }));
+        Self {
+            data: PrefixColumn::from_column(column),
+            cache,
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.data.len()
     }

@@ -65,6 +65,23 @@ pub(crate) struct OpSet {
     pub(crate) text_encoding: TextEncoding,
 }
 
+/// `values` as a column, streamed through an encoder that cuts slabs as
+/// it goes, so the column is handed over without a splice.
+fn stream_column<'a, T, WF, Idx>(
+    values: impl IntoIterator<Item = T::Get<'a>>,
+) -> hexane::Column<T, hexane::Leb128, WF, Idx>
+where
+    T: hexane::ColumnValueRef,
+    hexane::Encoder<'a, T>: Default,
+    WF: hexane::column::WeightFn<T, hexane::Leb128>,
+    Idx: hexane::index::ColumnIndex<WF::Weight>,
+{
+    use hexane::EncoderApi;
+    let mut e = hexane::Encoder::<T>::default().with_segments();
+    e.extend(values);
+    e.into_column()
+}
+
 impl OpSet {
     #[cfg(test)]
     pub(crate) fn debug_cmp(&self, other: &Self) {
@@ -264,22 +281,21 @@ impl OpSet {
         data.truncate(change_len);
         self.cols = loaded?;
         let enc = self.text_encoding;
-        let text = hexane::PrefixColumn::from_values(
+        let text = hexane::PrefixColumn::from_column(stream_column(
             ops.iter()
-                .map(|op| TxOp::top(op).then(|| TxOp::width(op, SequenceType::Text, enc) as u32))
-                .collect(),
-        );
-        let top = hexane::PrefixColumn::from_values(ops.iter().map(TxOp::top).collect());
-        let visible = hexane::Column::from_values(ops.iter().map(TxOp::visible).collect());
-        let inc = hexane::Column::from_values(ops.iter().flat_map(TxOp::succ_inc).collect());
-        let mut mark = MarkIndexColumn::new();
-        mark.extend(0, ops.iter().map(TxOp::mark_index).collect());
+                .map(|op| TxOp::top(op).then(|| TxOp::width(op, SequenceType::Text, enc) as u32)),
+        ));
+        let top = hexane::PrefixColumn::from_column(stream_column(ops.iter().map(TxOp::top)));
+        let visible = stream_column(ops.iter().map(TxOp::visible));
+        let inc = stream_column(ops.iter().flat_map(TxOp::succ_inc));
+        let mark = MarkIndexColumn::from_builders(ops.iter().map(TxOp::mark_index));
+        let infos: Vec<_> = ops
+            .iter()
+            .filter_map(|op| Some((op.id(), op.obj_info()?)))
+            .collect();
         let mut obj_info = ObjIndex::default();
-        for op in ops {
-            if let Some(info) = op.obj_info() {
-                obj_info.insert(op.id(), info);
-            }
-        }
+        obj_info.0.reserve(infos.len());
+        obj_info.0.extend(infos);
         self.set_indexes(Indexes {
             text,
             top,
