@@ -6,6 +6,7 @@ use super::{parse, shift_range, ChunkType, Header, RawColumns};
 
 use crate::author::Authors;
 use crate::change_graph::{ChangeGraph, ChangeGraphCols};
+use crate::op_set2::change::collector::index_ops;
 use crate::op_set2::change::{ChangeCollector, CollectedChanges, OutOfMemory};
 use crate::op_set2::op_set::MarkOrderValidator;
 use crate::op_set2::{OpSet, ReadOpError};
@@ -325,11 +326,37 @@ impl<'a> Document<'a> {
         &self,
         mode: VerificationMode,
         text_encoding: TextEncoding,
+        deferred_hashes: bool,
     ) -> Result<Automerge, ReconstructError> {
         let mut op_set = OpSet::load(self, text_encoding)?;
         let change_cols = ChangeGraphCols::load(self)?;
 
         let mut index = op_set.index_builder();
+
+        // Trusting the stored head, the changes need not be rebuilt to
+        // learn their hashes: only the op index is built now.
+        let change_cols = if deferred_hashes {
+            let mut authors = Authors::with_actors(change_cols.len());
+            match change_cols.finalize_deferred(&mut authors) {
+                Ok(change_graph) => {
+                    index_ops(&op_set, &mut index)?;
+                    let (indexes, mut mark_order_validator) = index.finish();
+                    op_set.set_indexes(indexes);
+                    debug_assert!(op_set.validate_top_index());
+                    let doc = Automerge::from_parts(op_set, change_graph, authors);
+                    return match mark_order_validator.take_error() {
+                        Some(err) => Err(ReconstructError::InvalidMarkOrderDoc {
+                            doc: Box::new(doc),
+                            error_message: err,
+                        }),
+                        None => Ok(doc),
+                    };
+                }
+                Err(change_cols) => *change_cols,
+            }
+        } else {
+            change_cols
+        };
 
         let change_collector = ChangeCollector::try_new(&change_cols, &op_set)?;
         let mut change_collector = change_collector.with_index(&mut index);

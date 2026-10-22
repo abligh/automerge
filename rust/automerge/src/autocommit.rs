@@ -420,6 +420,26 @@ impl AutoCommit {
         self.doc.hydrate_in_one_pass()
     }
 
+    /// As [`Automerge::hashes_deferred`].
+    pub fn hashes_deferred(&self) -> bool {
+        self.doc.hashes_deferred()
+    }
+
+    /// As [`Automerge::hashes_and_op_counts`], of the committed changes.
+    pub fn hashes_and_op_counts(&mut self) -> Vec<(ChangeHash, u64)> {
+        self.ensure_transaction_closed();
+        self.doc.hashes_and_op_counts()
+    }
+
+    /// As [`Automerge::fill_deferred_hashes`].
+    pub fn fill_deferred_hashes(
+        &mut self,
+        changes: &[(ChangeHash, u64)],
+    ) -> Result<(), crate::DeferredMismatch> {
+        self.ensure_transaction_closed();
+        self.doc.fill_deferred_hashes(changes)
+    }
+
     /// Every object's top ops, uncommitted ops included, as
     /// [`Automerge::gather_in_one_pass`] gathers them.
     pub fn gather_in_one_pass(&self) -> hydrate::Gathered {
