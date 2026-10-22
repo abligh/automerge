@@ -414,6 +414,28 @@ impl AutoCommit {
         self.doc.get_actor()
     }
 
+    /// The whole document, uncommitted ops included, as
+    /// [`Automerge::hydrate_in_one_pass`] reads it.
+    pub fn hydrate_in_one_pass(&self) -> hydrate::Value {
+        self.doc.hydrate_in_one_pass()
+    }
+
+    /// Every object's top ops, uncommitted ops included, as
+    /// [`Automerge::gather_in_one_pass`] gathers them.
+    pub fn gather_in_one_pass(&self) -> hydrate::Gathered {
+        self.doc.gather_in_one_pass()
+    }
+
+    /// The object `obj` built from `gathered`, as
+    /// [`Automerge::hydrate_gathered`] builds it.
+    pub fn hydrate_gathered(
+        &self,
+        gathered: &mut hydrate::Gathered,
+        obj: &ExId,
+    ) -> Result<hydrate::Value, AutomergeError> {
+        self.doc.hydrate_gathered(gathered, obj)
+    }
+
     pub fn get_actors_for_author(&self, author: &Author<'_>) -> Vec<ActorId> {
         self.doc.get_actors_for_author(author)
     }

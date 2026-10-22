@@ -1245,6 +1245,13 @@ impl OpSet {
         })
     }
 
+    /// The top ops of every object, in op set order: each object's in
+    /// turn, as [`OpSet::top_ops`] gives them one object at a time,
+    /// but read in one pass with no seek per object.
+    pub(crate) fn top_ops_of_all(&self) -> TopOps<'_> {
+        TopOps::new(self, None, 0..self.len())
+    }
+
     pub(crate) fn top_ops<'a>(&'a self, obj: &ObjId, clock: Option<Clock>) -> TopOps<'a> {
         let range = self.scope_to_obj(obj);
         let fast = TopOps::new(self, clock.clone(), range);
