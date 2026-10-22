@@ -45,14 +45,33 @@ pub enum Node {
 }
 
 impl Node {
-    /// A map of `entries`, which must be as [`Node::Map`] says: keys
-    /// unique and sorted (checked in debug builds).
-    fn map(entries: Vec<(String, Node)>) -> Self {
+    /// A map of `entries`, whose keys must be unique. They are sorted
+    /// if they are not already, which costs one comparison per entry
+    /// when they are, as they are when gathered, so [`Node::Map`]'s
+    /// order holds in release builds too.
+    fn map(mut entries: Vec<(String, Node)>) -> Self {
+        if !entries.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
         debug_assert!(
             entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
-            "map keys unique and sorted"
+            "map keys unique"
         );
         Node::Map(entries)
+    }
+}
+
+impl From<&Map> for Node {
+    /// The map node holding what `map` holds: its entries sorted by key,
+    /// with neither conflict flags nor marks. Converts a hydrated map
+    /// without wrapping it in a [`Value`].
+    fn from(map: &Map) -> Self {
+        // In the hash map's order; `Node::map` sorts them.
+        Node::map(
+            map.iter()
+                .map(|(key, entry)| (key.clone(), Node::from(&entry.value)))
+                .collect(),
+        )
     }
 }
 
@@ -62,14 +81,7 @@ impl From<&Value> for Node {
     fn from(value: &Value) -> Self {
         match value {
             Value::Scalar(scalar) => Node::Scalar(scalar.clone()),
-            Value::Map(map) => {
-                let mut entries: Vec<(String, Node)> = map
-                    .iter()
-                    .map(|(key, entry)| (key.clone(), Node::from(&entry.value)))
-                    .collect();
-                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                Node::map(entries)
-            }
+            Value::Map(map) => Node::from(map),
             Value::List(list) => {
                 Node::List(list.iter().map(|entry| Node::from(&entry.value)).collect())
             }
