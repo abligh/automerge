@@ -1729,6 +1729,19 @@ impl Automerge {
         Ok(gathered.hydrate(self.ops(), &id, typ, self.text_encoding()))
     }
 
+    /// The object `obj` built from `gathered`, as
+    /// [`Automerge::hydrate_gathered`] builds it, but as a
+    /// [`hydrate::Node`], with no hash map per map. Its ops, and those
+    /// of the objects inside it, are taken out of `gathered`.
+    pub fn take_gathered(
+        &self,
+        gathered: &mut hydrate::Gathered,
+        obj: &ExId,
+    ) -> Result<hydrate::Node, AutomergeError> {
+        let ObjMeta { id, typ } = self.exid_to_obj(obj)?;
+        Ok(gathered.take(self.ops(), &id, typ))
+    }
+
     pub fn hydrate(&self, heads: Option<&[ChangeHash]>) -> hydrate::Value {
         let clock = heads.and_then(|heads| self.clock_at(heads));
         self.hydrate_map(&ObjId::root(), clock.as_ref())
