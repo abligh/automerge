@@ -38,3 +38,58 @@ fn simple_hydrate() -> Result<(), AutomergeError> {
     assert_eq!(String::from(val), "hello big bad world".to_string(),);
     Ok(())
 }
+
+/// `Node::map` sorts entries that come to it out of order, in release
+/// builds as in debug ones, so a reader may binary search a map's keys.
+#[test]
+fn node_map_sorts_unsorted_keys() {
+    let entries = ["b", "", "a", "B", "\u{e9}", "aa"]
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            (
+                key.to_string(),
+                hydrate::Node::Scalar(ScalarValue::Int(i as i64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut sorted = entries.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        hydrate::Node::map(entries),
+        hydrate::Node::Map(sorted.clone())
+    );
+    // Already sorted entries are kept as they are.
+    assert_eq!(
+        hydrate::Node::map(sorted.clone()),
+        hydrate::Node::Map(sorted)
+    );
+}
+
+/// A hydrated map converts to the node its value converts to, without
+/// being wrapped in a `Value`.
+#[test]
+fn node_from_map_is_node_from_its_value() {
+    let mut doc = AutoCommit::new();
+    let map = doc.put_object(&ObjId::Root, "map", ObjType::Map).unwrap();
+    for key in ["z", "a", "m", "B", "\u{1F600}", ""] {
+        doc.put(&map, key, key.len() as i64).unwrap();
+    }
+    let inner = doc.put_object(&map, "inner", ObjType::Map).unwrap();
+    doc.put(&inner, "y", 1).unwrap();
+    doc.put(&inner, "x", 2).unwrap();
+    let list = doc.put_object(&map, "list", ObjType::List).unwrap();
+    doc.insert(&list, 0, "one").unwrap();
+    let hydrate::Value::Map(hydrated) = doc.hydrate(&map, None).unwrap() else {
+        panic!("a map");
+    };
+    let node = hydrate::Node::from(&hydrated);
+    assert_eq!(
+        node,
+        hydrate::Node::from(&hydrate::Value::Map(hydrated.clone()))
+    );
+    let hydrate::Node::Map(entries) = node else {
+        panic!("a map node");
+    };
+    assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
+}

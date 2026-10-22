@@ -4,7 +4,7 @@ use crate::types::{Clock, ObjId, ScalarValue, SequenceType};
 use crate::TextEncoding;
 use crate::{error::HydrateError, value, ObjType, Patch, PatchAction, Prop};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 mod list;
 mod map;
@@ -45,14 +45,33 @@ pub enum Node {
 }
 
 impl Node {
-    /// A map of `entries`, which must be as [`Node::Map`] says: keys
-    /// unique and sorted (checked in debug builds).
-    fn map(entries: Vec<(String, Node)>) -> Self {
+    /// A map of `entries`, whose keys must be unique. They are sorted
+    /// if they are not already, which costs one comparison per entry
+    /// when they are, as they are when gathered, so [`Node::Map`]'s
+    /// order holds in release builds too.
+    fn map(mut entries: Vec<(String, Node)>) -> Self {
+        if !entries.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
         debug_assert!(
             entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
-            "map keys unique and sorted"
+            "map keys unique"
         );
         Node::Map(entries)
+    }
+}
+
+impl From<&Map> for Node {
+    /// The map node holding what `map` holds: its entries sorted by key,
+    /// with neither conflict flags nor marks. Converts a hydrated map
+    /// without wrapping it in a [`Value`].
+    fn from(map: &Map) -> Self {
+        // In the hash map's order; `Node::map` sorts them.
+        Node::map(
+            map.iter()
+                .map(|(key, entry)| (key.clone(), Node::from(&entry.value)))
+                .collect(),
+        )
     }
 }
 
@@ -62,14 +81,7 @@ impl From<&Value> for Node {
     fn from(value: &Value) -> Self {
         match value {
             Value::Scalar(scalar) => Node::Scalar(scalar.clone()),
-            Value::Map(map) => {
-                let mut entries: Vec<(String, Node)> = map
-                    .iter()
-                    .map(|(key, entry)| (key.clone(), Node::from(&entry.value)))
-                    .collect();
-                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                Node::map(entries)
-            }
+            Value::Map(map) => Node::from(map),
             Value::List(list) => {
                 Node::List(list.iter().map(|entry| Node::from(&entry.value)).collect())
             }
@@ -347,22 +359,38 @@ impl OpSet {
     /// [`Gathered::hydrate`] to build objects from.
     pub(crate) fn gather_in_one_pass(&self) -> Gathered {
         let mut objects: HashMap<ObjId, Vec<Entry>> = HashMap::new();
-        let mut current: Option<(ObjId, Vec<Entry>)> = None;
-        // A text object is read whole by `hydrate_text` when it is
-        // built, so its own ops, characters and marks, are passed over.
-        // Every object is made before its ops, so its make op is met
-        // first.
-        let mut texts: HashSet<ObjId> = HashSet::new();
+        let mut in_text: HashMap<ObjId, Vec<ObjId>> = HashMap::new();
+        // Each object met inside a text, mapped to that text.
+        let mut text_of: HashMap<ObjId, ObjId> = HashMap::new();
+        // The object whose top ops are being read, and its entries, or
+        // `None` for a text: a text object is read whole by
+        // `hydrate_text` when it is built, so its own ops, characters
+        // and marks, are passed over. An object inside a text, such as a
+        // block map, is gathered and recorded in `in_text`, so that
+        // building the text, which reads it whole, takes it out. An
+        // object comes after its parent in op set order, so its parent
+        // has been met.
+        let mut current: Option<(ObjId, Option<Vec<Entry>>)> = None;
         for top in self.top_rows_of_all() {
-            if texts.contains(&top.obj) {
-                continue;
-            }
             if current.as_ref().map(|(obj, _)| *obj) != Some(top.obj) {
-                if let Some((obj, entries)) = current.take() {
+                if let Some((obj, Some(entries))) = current.take() {
                     objects.insert(obj, entries);
                 }
-                current = Some((top.obj, Vec::new()));
+                let is_text = self.object_type(&top.obj) == Some(ObjType::Text);
+                if is_text {
+                    text_of.insert(top.obj, top.obj);
+                } else if let Some(text) = self
+                    .object_parent(&top.obj)
+                    .and_then(|parent| text_of.get(&parent).copied())
+                {
+                    text_of.insert(top.obj, text);
+                    in_text.entry(text).or_default().push(top.obj);
+                }
+                current = Some((top.obj, (!is_text).then(Vec::new)));
             }
+            let Some((_, Some(entries))) = current.as_mut() else {
+                continue;
+            };
             // A sequence's element has a `Seq` key column, whether it
             // was inserted or overwrites an element.
             let key = match top.key {
@@ -373,27 +401,23 @@ impl OpSet {
                 Action::MakeMap => Slot::Object(top.id.into(), ObjType::Map),
                 Action::MakeTable => Slot::Object(top.id.into(), ObjType::Table),
                 Action::MakeList => Slot::Object(top.id.into(), ObjType::List),
-                Action::MakeText => {
-                    texts.insert(top.id.into());
-                    Slot::Object(top.id.into(), ObjType::Text)
-                }
+                Action::MakeText => Slot::Object(top.id.into(), ObjType::Text),
                 Action::Set => Slot::Scalar(top.value.into()),
                 // Marks belong to text, read with it; nothing else is a
                 // top op.
                 _ => continue,
             };
-            let entries = &mut current.as_mut().expect("set above").1;
             entries.push(Entry {
                 key,
                 slot,
                 conflict: top.conflict,
             });
         }
-        if let Some((obj, entries)) = current {
+        if let Some((obj, Some(entries))) = current {
             objects.insert(obj, entries);
         }
         objects.shrink_to_fit();
-        Gathered { objects }
+        Gathered { objects, in_text }
     }
 
     pub(crate) fn hydrate_op(
@@ -422,6 +446,10 @@ impl OpSet {
 #[derive(Debug, Default)]
 pub struct Gathered {
     objects: HashMap<ObjId, Vec<Entry>>,
+    /// For each text object, the objects inside it (block maps and the
+    /// objects in those), which building the text, read whole from the
+    /// document, takes out of the gathering.
+    in_text: HashMap<ObjId, Vec<ObjId>>,
 }
 
 /// One top op of an object, as [`Gathered`] holds it: its map key, if
@@ -450,6 +478,14 @@ impl Gathered {
         self.objects.is_empty()
     }
 
+    /// Takes the objects inside the text `text` out of the gathering:
+    /// the text is read whole from the document.
+    fn take_text_objects(&mut self, text: &ObjId) {
+        for obj in self.in_text.remove(text).unwrap_or_default() {
+            self.objects.remove(&obj);
+        }
+    }
+
     /// The value of `obj`, of type `typ`, as [`Gathered::hydrate`]
     /// builds it, but as a [`Node`]: its gathered entries and,
     /// recursively, those of the objects they make, each taken out of
@@ -457,6 +493,7 @@ impl Gathered {
     /// entries, or one already taken, is empty.
     pub(crate) fn take(&mut self, ops: &OpSet, obj: &ObjId, typ: ObjType) -> Node {
         if typ == ObjType::Text {
+            self.take_text_objects(obj);
             return Node::Text(ops.text(obj, None));
         }
         let entries = self.objects.remove(obj).unwrap_or_default();
@@ -492,6 +529,7 @@ impl Gathered {
         encoding: TextEncoding,
     ) -> Value {
         if typ == ObjType::Text {
+            self.take_text_objects(obj);
             return ops.hydrate_text(obj, None, encoding);
         }
         let entries = self.objects.remove(obj).unwrap_or_default();
