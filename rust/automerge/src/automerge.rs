@@ -1633,10 +1633,39 @@ impl Automerge {
     /// The whole document at its current heads, as
     /// [`Automerge::hydrate`] gives it with no heads, read in one
     /// ordered pass over the ops rather than one seek per object: much
-    /// faster for a document of many small objects, at the cost of the
-    /// gathered ops of every object being held until the tree is built.
+    /// faster for a document of many small objects. The gathered ops
+    /// and the tree are both held until the tree is built; to build a
+    /// large document's objects one at a time, use
+    /// [`Automerge::gather_in_one_pass`].
     pub fn hydrate_in_one_pass(&self) -> hydrate::Value {
-        self.ops().hydrate_root_in_one_pass(self.text_encoding())
+        let mut gathered = self.gather_in_one_pass();
+        gathered.hydrate(
+            self.ops(),
+            &ObjId::root(),
+            ObjType::Map,
+            self.text_encoding(),
+        )
+    }
+
+    /// Every object's top ops at the current heads, gathered in one
+    /// ordered pass over the ops, for [`Automerge::hydrate_gathered`]
+    /// to build objects from without a seek to each.
+    pub fn gather_in_one_pass(&self) -> hydrate::Gathered {
+        self.ops().gather_in_one_pass()
+    }
+
+    /// The object `obj`, as [`crate::ReadDoc::hydrate`] gives it with
+    /// no heads, built from `gathered`, which must have been gathered
+    /// from this document as it is now. The object's ops, and those of
+    /// the objects inside it, are taken out of `gathered`, so building
+    /// it again, or an object inside it, gives an empty object.
+    pub fn hydrate_gathered(
+        &self,
+        gathered: &mut hydrate::Gathered,
+        obj: &ExId,
+    ) -> Result<hydrate::Value, AutomergeError> {
+        let ObjMeta { id, typ } = self.exid_to_obj(obj)?;
+        Ok(gathered.hydrate(self.ops(), &id, typ, self.text_encoding()))
     }
 
     pub fn hydrate(&self, heads: Option<&[ChangeHash]>) -> hydrate::Value {

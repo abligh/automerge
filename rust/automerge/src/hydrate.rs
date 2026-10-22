@@ -292,12 +292,15 @@ impl OpSet {
     /// the tree is assembled from the root afterwards. Hydrating one
     /// object at a time seeks every column to each object's ops, which
     /// for a document of many small maps costs more than reading them.
-    pub(crate) fn hydrate_root_in_one_pass(&self, encoding: TextEncoding) -> Value {
+    /// Every object's top ops, gathered in one ordered pass, for
+    /// [`Gathered::hydrate`] to build objects from.
+    pub(crate) fn gather_in_one_pass(&self) -> Gathered {
         let mut objects: HashMap<ObjId, Vec<Entry>> = HashMap::new();
         let mut current: Option<(ObjId, Vec<Entry>)> = None;
-        // A text object is read whole by `hydrate_text`, so its own
-        // ops, characters and marks, are passed over. Every object is
-        // made before its ops, so its make op is met first.
+        // A text object is read whole by `hydrate_text` when it is
+        // built, so its own ops, characters and marks, are passed over.
+        // Every object is made before its ops, so its make op is met
+        // first.
         let mut texts: HashSet<ObjId> = HashSet::new();
         for top in self.top_ops_of_all() {
             if texts.contains(&top.obj) {
@@ -314,12 +317,13 @@ impl OpSet {
                 KeyRef::Seq(_) => None,
             };
             let slot = match top.action() {
-                OpType::Make(ObjType::Text) => {
-                    texts.insert(top.id.into());
-                    Slot::Value(self.hydrate_text(&top.id.into(), None, encoding))
+                OpType::Make(typ) => {
+                    if typ == ObjType::Text {
+                        texts.insert(top.id.into());
+                    }
+                    Slot::Object(top.id.into(), typ)
                 }
-                OpType::Make(typ) => Slot::Object(top.id.into(), typ),
-                OpType::Put(scalar) => Slot::Value(Value::Scalar(scalar.into())),
+                OpType::Put(scalar) => Slot::Scalar(scalar.into()),
                 // Marks belong to text, read with it; nothing else is a
                 // top op.
                 _ => continue,
@@ -334,7 +338,8 @@ impl OpSet {
         if let Some((obj, entries)) = current {
             objects.insert(obj, entries);
         }
-        assemble(&mut objects, &ObjId::root(), ObjType::Map)
+        objects.shrink_to_fit();
+        Gathered { objects }
     }
 
     pub(crate) fn hydrate_op(
@@ -354,49 +359,83 @@ impl OpSet {
     }
 }
 
-/// One top op of an object, as [`OpSet::hydrate_root_in_one_pass`]
-/// gathers it: its map key, if the object is a map, and its value or
-/// the object it makes.
+/// Every object's top ops at the current heads, gathered by
+/// [`Automerge::gather_in_one_pass`] in one ordered pass over the ops,
+/// so that [`Automerge::hydrate_gathered`] can build each object
+/// without seeking to it. Building an object takes its ops, and those
+/// of the objects inside it, out of the gathering, so each object can
+/// be built once; the gathering shrinks as objects are built.
+#[derive(Debug, Default)]
+pub struct Gathered {
+    objects: HashMap<ObjId, Vec<Entry>>,
+}
+
+/// One top op of an object, as [`Gathered`] holds it: its map key, if
+/// the object is a map, and its value or the object it makes.
+#[derive(Debug)]
 struct Entry {
     key: Option<String>,
     slot: Slot,
     conflict: bool,
 }
 
+#[derive(Debug)]
 enum Slot {
-    Value(Value),
+    Scalar(ScalarValue),
     Object(ObjId, ObjType),
 }
 
-/// The value of `obj`, of type `typ`, built from the entries gathered
-/// for it and, recursively, for the objects they make; each is taken
-/// out of `objects`. An object with no entries is empty.
-fn assemble(objects: &mut HashMap<ObjId, Vec<Entry>>, obj: &ObjId, typ: ObjType) -> Value {
-    let entries = objects.remove(obj).unwrap_or_default();
-    let mut value = |slot| match slot {
-        Slot::Value(value) => value,
-        Slot::Object(child, typ) => assemble(objects, &child, typ),
-    };
-    match typ {
-        ObjType::Map | ObjType::Table => {
-            let mut map = Map::new();
-            for Entry {
-                key,
-                slot,
-                conflict,
-            } in entries
-            {
-                let value = value(slot);
-                map.insert(key.unwrap_or_default(), MapValue { value, conflict });
-            }
-            Value::Map(map)
+impl Gathered {
+    /// How many objects are gathered and not yet built.
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Whether every gathered object has been built.
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// The value of `obj`, of type `typ`, built from its gathered
+    /// entries and, recursively, those of the objects they make, each
+    /// taken out of the gathering. Text is read from `ops`. An object
+    /// with no entries, or one already built, is empty.
+    pub(crate) fn hydrate(
+        &mut self,
+        ops: &OpSet,
+        obj: &ObjId,
+        typ: ObjType,
+        encoding: TextEncoding,
+    ) -> Value {
+        if typ == ObjType::Text {
+            return ops.hydrate_text(obj, None, encoding);
         }
-        ObjType::List | ObjType::Text => {
-            let mut list = List::new();
-            for Entry { slot, conflict, .. } in entries {
-                list.push_value(value(slot), conflict);
+        let entries = self.objects.remove(obj).unwrap_or_default();
+        let mut value = |slot| match slot {
+            Slot::Scalar(scalar) => Value::Scalar(scalar),
+            Slot::Object(child, typ) => self.hydrate(ops, &child, typ, encoding),
+        };
+        match typ {
+            ObjType::Map | ObjType::Table => {
+                let mut map = Map::new();
+                for Entry {
+                    key,
+                    slot,
+                    conflict,
+                } in entries
+                {
+                    let value = value(slot);
+                    map.insert(key.unwrap_or_default(), MapValue { value, conflict });
+                }
+                Value::Map(map)
             }
-            Value::List(list)
+            ObjType::List | ObjType::Text => {
+                let mut list = List::new();
+                for Entry { slot, conflict, .. } in entries {
+                    list.push_value(value(slot), conflict);
+                }
+                Value::List(list)
+            }
         }
     }
 }

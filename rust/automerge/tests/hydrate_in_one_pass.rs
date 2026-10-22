@@ -1,12 +1,36 @@
-//! `hydrate_in_one_pass` reads what `hydrate` reads with no heads, for
-//! every kind of object and value, after deletions, overwrites,
-//! increments, merges with conflicts, and a save and load.
+//! `hydrate_in_one_pass`, and `hydrate_gathered` object by object,
+//! read what `hydrate` reads with no heads, for every kind of object
+//! and value, after deletions, overwrites, increments, merges with
+//! conflicts, and a save and load.
 use automerge::marks::{ExpandMark, Mark};
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ObjType, ReadDoc, ScalarValue, ROOT};
 
 fn same(doc: &AutoCommit) {
     assert_eq!(doc.hydrate_in_one_pass(), doc.hydrate(&ROOT, None).unwrap());
+    same_one_at_a_time(doc);
+}
+
+/// Each object under `nodes`, built from one gathering in turn, is
+/// what `hydrate` gives for it alone, and building takes it out.
+fn same_one_at_a_time(doc: &AutoCommit) {
+    let Some((_, nodes)) = doc.get(&ROOT, "nodes").unwrap() else {
+        return;
+    };
+    let mut gathered = doc.gather_in_one_pass();
+    let before = gathered.len();
+    for item in doc.map_range(&nodes, ..) {
+        let id = item.id();
+        if !matches!(item.value, automerge::ValueRef::Object(_)) {
+            continue;
+        }
+        let built = doc.hydrate_gathered(&mut gathered, &id).unwrap();
+        assert_eq!(built, doc.hydrate(&id, None).unwrap(), "{}", item.key);
+        // Built once; a second build finds nothing left.
+        let again = doc.hydrate_gathered(&mut gathered, &id).unwrap();
+        assert_ne!(again, built, "{} built twice", item.key);
+    }
+    assert!(gathered.len() < before);
 }
 
 /// A document holding one of everything, some of it changed after.
