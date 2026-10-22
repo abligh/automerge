@@ -1,4 +1,4 @@
-use crate::op_set2::types::KeyRef;
+use crate::op_set2::types::{Action, KeyRef};
 use crate::op_set2::{Op, OpSet, OpType};
 use crate::types::{Clock, ObjId, ScalarValue, SequenceType};
 use crate::TextEncoding;
@@ -302,7 +302,7 @@ impl OpSet {
         // Every object is made before its ops, so its make op is met
         // first.
         let mut texts: HashSet<ObjId> = HashSet::new();
-        for top in self.top_ops_of_all() {
+        for top in self.top_rows_of_all() {
             if texts.contains(&top.obj) {
                 continue;
             }
@@ -312,18 +312,21 @@ impl OpSet {
                 }
                 current = Some((top.obj, Vec::new()));
             }
-            let key = match top.elemid_or_key() {
+            // A sequence's element has a `Seq` key column, whether it
+            // was inserted or overwrites an element.
+            let key = match top.key {
                 KeyRef::Map(key) => Some(key.into_owned()),
                 KeyRef::Seq(_) => None,
             };
-            let slot = match top.action() {
-                OpType::Make(typ) => {
-                    if typ == ObjType::Text {
-                        texts.insert(top.id.into());
-                    }
-                    Slot::Object(top.id.into(), typ)
+            let slot = match top.action {
+                Action::MakeMap => Slot::Object(top.id.into(), ObjType::Map),
+                Action::MakeTable => Slot::Object(top.id.into(), ObjType::Table),
+                Action::MakeList => Slot::Object(top.id.into(), ObjType::List),
+                Action::MakeText => {
+                    texts.insert(top.id.into());
+                    Slot::Object(top.id.into(), ObjType::Text)
                 }
-                OpType::Put(scalar) => Slot::Scalar(scalar.into()),
+                Action::Set => Slot::Scalar(top.value.into()),
                 // Marks belong to text, read with it; nothing else is a
                 // top op.
                 _ => continue,
