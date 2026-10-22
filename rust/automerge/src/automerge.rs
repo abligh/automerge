@@ -1630,6 +1630,15 @@ impl Automerge {
         acc.into_iter_no_unmark().collect()
     }
 
+    /// The whole document at its current heads, as
+    /// [`Automerge::hydrate`] gives it with no heads, read in one
+    /// ordered pass over the ops rather than one seek per object: much
+    /// faster for a document of many small objects, at the cost of the
+    /// gathered ops of every object being held until the tree is built.
+    pub fn hydrate_in_one_pass(&self) -> hydrate::Value {
+        self.ops().hydrate_root_in_one_pass(self.text_encoding())
+    }
+
     pub fn hydrate(&self, heads: Option<&[ChangeHash]>) -> hydrate::Value {
         let clock = heads.and_then(|heads| self.clock_at(heads));
         self.hydrate_map(&ObjId::root(), clock.as_ref())

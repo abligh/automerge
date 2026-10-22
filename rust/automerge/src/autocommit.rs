@@ -414,6 +414,12 @@ impl AutoCommit {
         self.doc.get_actor()
     }
 
+    /// The whole document, uncommitted ops included, as
+    /// [`Automerge::hydrate_in_one_pass`] reads it.
+    pub fn hydrate_in_one_pass(&self) -> hydrate::Value {
+        self.doc.hydrate_in_one_pass()
+    }
+
     pub fn get_actors_for_author(&self, author: &Author<'_>) -> Vec<ActorId> {
         self.doc.get_actors_for_author(author)
     }
