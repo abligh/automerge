@@ -52,7 +52,7 @@ pub(crate) use op_iter::{
     OpIter, ReadOpError, SuccIterIter, SuccWalker, ValueIter,
 };
 pub(crate) use op_query::{FixCounters, OpQuery, OpQueryTerm};
-pub(crate) use top_op::{TopIter, TopOps};
+pub(crate) use top_op::{TopIter, TopOps, TopRows};
 pub(crate) use visible::{VisIter, VisibleOpIter};
 
 pub(crate) type InsertAcc<'a> = hexane::PrefixIter<'a, bool>;
@@ -1247,9 +1247,18 @@ impl OpSet {
 
     /// The top ops of every object, in op set order: each object's in
     /// turn, as [`OpSet::top_ops`] gives them one object at a time,
-    /// but read in one pass with no seek per object.
+    /// but read in one pass with no seek per object. Kept to test
+    /// [`OpSet::top_rows_of_all`] against.
+    #[cfg(test)]
     pub(crate) fn top_ops_of_all(&self) -> TopOps<'_> {
         TopOps::new(self, None, 0..self.len())
+    }
+
+    /// The top ops of every object at the current heads, as
+    /// [`OpSet::top_ops_of_all`] gives them, but each read as a
+    /// [`TopRow`], decoding only the columns a row holds.
+    pub(crate) fn top_rows_of_all(&self) -> TopRows<'_> {
+        TopRows::new(self)
     }
 
     pub(crate) fn top_ops<'a>(&'a self, obj: &ObjId, clock: Option<Clock>) -> TopOps<'a> {
@@ -2020,6 +2029,128 @@ mod tests {
 
     use rand::distr::Alphanumeric;
     use rand::RngExt;
+
+    /// A document with ops of every kind that stop being top ops:
+    /// overwritten, deleted, incremented, conflicting after a merge of
+    /// three actors, in maps, tables, lists and text, some left
+    /// uncommitted.
+    fn superseded_and_deleted() -> AutoCommit {
+        let mut doc = AutoCommit::new().with_actor(ActorId::from(b"aaaa".as_slice()));
+        doc.put(crate::ROOT, "name", "first").unwrap();
+        doc.put(crate::ROOT, "name", "second").unwrap();
+        doc.put(crate::ROOT, "gone", 1).unwrap();
+        doc.delete(crate::ROOT, "gone").unwrap();
+        doc.put(crate::ROOT, "count", ScalarValue::Counter(5))
+            .unwrap();
+        doc.increment(crate::ROOT, "count", 3).unwrap();
+        doc.put(crate::ROOT, "big", "x".repeat(300).as_str())
+            .unwrap();
+        let nodes = doc.put_object(crate::ROOT, "nodes", ObjType::Map).unwrap();
+        for i in 0..30 {
+            let node = doc
+                .put_object(&nodes, format!("n{i:02}"), ObjType::Map)
+                .unwrap();
+            doc.put(&node, "at", i as i64).unwrap();
+            let list = doc.put_object(&node, "items", ObjType::List).unwrap();
+            for j in 0..(i % 5) {
+                doc.insert(&list, j, j as i64).unwrap();
+            }
+            if i % 5 > 2 {
+                doc.delete(&list, 1).unwrap();
+                doc.put(&list, 0, "overwritten").unwrap();
+                doc.put(&list, 0, ScalarValue::Counter(1)).unwrap();
+                doc.increment(&list, 0, 2).unwrap();
+            }
+            if i % 4 == 0 {
+                let text = doc.put_object(&node, "lines", ObjType::Text).unwrap();
+                doc.splice_text(&text, 0, 0, "hello world").unwrap();
+                doc.splice_text(&text, 2, 3, "").unwrap();
+                doc.mark(
+                    &text,
+                    crate::marks::Mark::new("bold".to_owned(), true, 0, 3),
+                    crate::marks::ExpandMark::After,
+                )
+                .unwrap();
+                doc.split_block(&text, 2).unwrap();
+            }
+            if i % 6 == 0 {
+                doc.put_object(&node, "table", ObjType::Table).unwrap();
+            }
+        }
+        doc.delete(&nodes, "n03").unwrap();
+        doc.put(&nodes, "n04", "now a scalar").unwrap();
+        doc.commit();
+        let mut right = doc.fork().with_actor(ActorId::from(b"bbbb".as_slice()));
+        let mut third = doc.fork().with_actor(ActorId::from(b"cccc".as_slice()));
+        doc.put(crate::ROOT, "name", "left").unwrap();
+        right.put(crate::ROOT, "name", "right").unwrap();
+        third.put(crate::ROOT, "name", "third").unwrap();
+        right.put_object(&nodes, "n10", ObjType::List).unwrap();
+        doc.put(&nodes, "n10", "left").unwrap();
+        right.increment(crate::ROOT, "count", 10).unwrap();
+        third.increment(crate::ROOT, "count", 100).unwrap();
+        third.delete(&nodes, "n11").unwrap();
+        right.put(&nodes, "n11", "kept by right").unwrap();
+        doc.merge(&mut right).unwrap();
+        doc.merge(&mut third).unwrap();
+        // Uncommitted ops are read too.
+        doc.put(crate::ROOT, "pending", true).unwrap();
+        doc.increment(crate::ROOT, "count", 1000).unwrap();
+        doc
+    }
+
+    /// `top_rows_of_all` reads, row for row, what `top_ops_of_all`
+    /// gives, and both are what a walk over every op finds: each
+    /// key's or element's last visible op, in conflict when another
+    /// visible op shares it.
+    fn top_rows_match(ops: &OpSet) {
+        let rows: Vec<_> = ops.top_rows_of_all().collect();
+        let tops: Vec<_> = ops.top_ops_of_all().collect();
+        assert_eq!(rows.len(), tops.len());
+        for (row, op) in rows.iter().zip(&tops) {
+            assert_eq!(row.pos, op.pos);
+            assert_eq!(row.obj, op.obj);
+            assert_eq!(row.id, op.id);
+            assert_eq!(row.key, op.key);
+            assert_eq!(row.action, op.action);
+            assert_eq!(row.value, op.value, "at {}", op.pos);
+            assert_eq!(row.conflict, op.conflict, "at {}", op.pos);
+        }
+        let mut slow: Vec<(usize, ScalarValue<'_>, bool)> = Vec::new();
+        let mut last: Option<(ObjId, KeyRef<'_>)> = None;
+        for mut op in ops.iter().filter(|op| op.visible()) {
+            let group = (op.obj, op.elemid_or_key());
+            op.fix_counter(None);
+            if last.as_ref() == Some(&group) {
+                slow.pop().expect("a group has an op");
+                slow.push((op.pos, op.value.clone(), true));
+            } else {
+                slow.push((op.pos, op.value.clone(), false));
+            }
+            last = Some(group);
+        }
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|row| (row.pos, row.value, row.conflict))
+            .collect();
+        assert_eq!(rows, slow);
+    }
+
+    #[test]
+    fn top_rows_read_what_top_ops_give() {
+        let mut doc = superseded_and_deleted();
+        // Many ops are no longer on top, some of them still visible.
+        let ops = doc.doc.ops();
+        let tops = ops.top_rows_of_all().count();
+        let visible = ops.iter().filter(|op| op.visible()).count();
+        assert!(ops.len() > tops + 50, "{} ops, {tops} top", ops.len());
+        assert!(visible >= tops + 3, "{visible} visible, {tops} top");
+        top_rows_match(doc.doc.ops());
+        doc.commit();
+        let loaded = AutoCommit::load(&doc.save()).unwrap();
+        top_rows_match(loaded.doc.ops());
+        top_rows_match(AutoCommit::new().doc.ops());
+    }
 
     #[test]
     fn suspend_resume_op_set_iter() {

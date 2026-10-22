@@ -2,14 +2,12 @@ use crate::clock::Clock;
 use crate::iter::tools::{BoolColumnSkipper, PeekShift, Shiftable, SkipIter, Skipper};
 use crate::marks::MarkSet;
 use crate::op_set2::op::SuccCursors;
-use crate::op_set2::types::Action;
-#[cfg(feature = "slow_path_assertions")]
-use crate::types::ObjId;
-use crate::types::OpId;
+use crate::op_set2::types::{Action, KeyRef, ScalarValue};
+use crate::types::{ObjId, OpId};
 
 use super::{
-    ActionIter, FixCounters, InsertIter, OpIdIter, OpIter, OpQueryTerm, OpSet, SuccIterIter,
-    VisIter,
+    ActionIter, FixCounters, InsertIter, OpIdIter, OpIter, OpQueryTerm, OpSet, ReadOpError,
+    SuccIterIter, VisIter,
 };
 
 use std::ops::Range;
@@ -357,4 +355,105 @@ fn is_visible(id: OpId, action: Action, succ: SuccCursors<'_>, clock: &Clock) ->
         }
     }
     true
+}
+
+/// One top op as [`TopRows`] reads it: only the columns a whole
+/// document's read needs. `key` is the op's key column, so an element
+/// of a sequence has a [`KeyRef::Seq`] key, though not its own element
+/// id; `value` has a counter's increments added, as [`TopOps`] gives
+/// it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TopRow<'a> {
+    pub(crate) pos: usize,
+    pub(crate) obj: ObjId,
+    pub(crate) id: OpId,
+    pub(crate) key: KeyRef<'a>,
+    pub(crate) action: Action,
+    pub(crate) value: ScalarValue<'a>,
+    pub(crate) conflict: bool,
+}
+
+/// The top ops of a whole op set at the current heads, as
+/// [`TopOps`] gives them with no clock, but decoding only the columns
+/// of a [`TopRow`] at each top op. The insert and mark columns are
+/// never read, and successors only for a counter; nothing is built as
+/// a whole [`super::Op`] and moved through iterator adapters.
+#[derive(Clone, Debug)]
+pub(crate) struct TopRows<'a> {
+    columns: OpIter<'a>,
+    top: TopIter<'a>,
+    visible: VisIter<'a>,
+    visible_pos: usize,
+    /// The position the obj, id, key, action and value columns read
+    /// next.
+    pos: usize,
+    /// The position the successor column reads next.
+    succ_pos: usize,
+}
+
+impl<'a> TopRows<'a> {
+    pub(crate) fn new(op_set: &'a OpSet) -> Self {
+        let range = 0..op_set.len();
+        Self {
+            columns: op_set.iter_range(&range),
+            top: TopIter::new(op_set, None, range.clone()),
+            visible: VisIter::new(op_set, None, range),
+            visible_pos: 0,
+            pos: 0,
+            succ_pos: 0,
+        }
+    }
+
+    fn try_next(&mut self) -> Result<Option<TopRow<'a>>, ReadOpError> {
+        let Some(skip) = self.top.next() else {
+            return Ok(None);
+        };
+        let columns = &mut self.columns;
+        let Some(id) = columns.id.maybe_try_nth(skip)? else {
+            return Ok(None);
+        };
+        let obj = columns.obj.try_nth(skip)?;
+        let key = columns.key.try_nth(skip)?;
+        let action = columns.action.try_nth(skip)?;
+        let mut value = columns.value.try_nth(skip)?;
+        let pos = self.pos + skip;
+        self.pos = pos + 1;
+        if let ScalarValue::Counter(n) = value {
+            let succ = columns.succ.try_nth(pos - self.succ_pos)?;
+            self.succ_pos = pos + 1;
+            let inc: i64 = succ.with_inc().filter_map(|(_, inc)| inc).sum();
+            value = ScalarValue::Counter(n + inc);
+        }
+        let mut conflict = false;
+        loop {
+            let skip = self.visible.next().expect("a top op must also be visible");
+            let visible = self.visible_pos + skip;
+            self.visible_pos = visible + 1;
+            assert!(
+                visible <= pos,
+                "visible op at {visible} advanced past top op at {pos}"
+            );
+            if visible == pos {
+                break;
+            }
+            conflict = true;
+        }
+        Ok(Some(TopRow {
+            pos,
+            obj,
+            id,
+            key,
+            action,
+            value,
+            conflict,
+        }))
+    }
+}
+
+impl<'a> Iterator for TopRows<'a> {
+    type Item = TopRow<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.try_next().expect("op set columns decode")
+    }
 }
