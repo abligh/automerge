@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 use std::ops::Add;
 use std::ops::RangeBounds;
 
+use crate::change::decode_author_footer;
 use crate::storage::BundleMetadata;
 use crate::{
     author::Authors,
@@ -44,7 +45,17 @@ pub(crate) struct ChangeGraph {
     seq_index: Vec<Vec<NodeIdx>>,
     fragment_top: SeqClock,
     fragments: Vec<FragmentNode>,
+    /// How many of the first changes were loaded without their hashes
+    /// ([`ChangeGraphCols::finalize_deferred`]); none once
+    /// [`ChangeGraph::fill_deferred_hashes`] has filled them. Of those,
+    /// only the heads' hashes are known.
+    pending: usize,
 }
+
+/// The panic message for a use of a change hash a deferred load has
+/// not yet learned.
+const DEFERRED: &str = "a change hash is needed that a deferred load has not yet \
+     learned; fill them with fill_deferred_hashes first";
 
 pub(crate) struct ChangeGraphCols(ChangeGraph);
 
@@ -102,6 +113,7 @@ impl ChangeGraph {
             seq_index: vec![vec![]; num_actors],
             fragments: vec![],
             fragment_top: SeqClock::new(num_actors),
+            pending: 0,
         }
     }
 
@@ -193,12 +205,101 @@ impl ChangeGraph {
         self.actors.is_empty()
     }
 
+    /// Panics if a deferred load's hashes are not yet filled.
+    fn require_hashes(&self) {
+        assert!(self.pending == 0, "{DEFERRED}");
+    }
+
+    /// The node of `hash`. Panics where a deferred load's hashes are
+    /// not yet filled and `hash` is not one of those known, since the
+    /// change may be one whose hash is not yet learned.
+    fn node_of(&self, hash: &ChangeHash) -> Option<NodeIdx> {
+        let node = self.nodes_by_hash.get(hash).copied();
+        if node.is_none() {
+            self.require_hashes();
+        }
+        node
+    }
+
+    /// Whether the hash of `node` is known: always, except for a
+    /// change a deferred load has not yet learned the hash of.
+    fn hash_known(&self, node: NodeIdx) -> bool {
+        let i = node.0 as usize;
+        i >= self.pending || self.nodes_by_hash.get(&self.hashes[i]) == Some(&node)
+    }
+
+    /// The hash of `node`. Panics if a deferred load has not yet
+    /// learned it.
+    fn hash_of(&self, node: NodeIdx) -> ChangeHash {
+        assert!(self.hash_known(node), "{DEFERRED}");
+        self.hashes[node.0 as usize]
+    }
+
+    /// Whether a deferred load's hashes are still to be filled.
+    pub(crate) fn hashes_deferred(&self) -> bool {
+        self.pending > 0
+    }
+
+    /// Fills the hashes and exact op counts a deferred load left out,
+    /// from `changes`: each change's hash and op count, in this graph's
+    /// order, as a full load of the same document finds them. Every
+    /// hash this graph already knows, the stored head's and those of
+    /// changes made since, must match, or nothing is filled. A graph
+    /// with nothing deferred is left as it is.
+    pub(crate) fn fill_deferred_hashes(
+        &mut self,
+        changes: &[(ChangeHash, u64)],
+    ) -> Result<(), DeferredMismatch> {
+        if self.pending == 0 {
+            return Ok(());
+        }
+        if changes.len() < self.pending || changes.len() > self.len() {
+            return Err(DeferredMismatch::Length {
+                expected: self.pending,
+                got: changes.len(),
+            });
+        }
+        for (i, (hash, _)) in changes.iter().enumerate() {
+            let node = NodeIdx(i as u32);
+            if self.hash_known(node) && self.hashes[i] != *hash {
+                return Err(DeferredMismatch::Hash {
+                    index: i,
+                    expected: self.hashes[i],
+                    got: *hash,
+                });
+            }
+        }
+        let mut num_ops: Vec<u64> = self.num_ops.iter().collect();
+        for (i, (hash, ops)) in changes.iter().enumerate() {
+            self.hashes[i] = *hash;
+            self.nodes_by_hash.insert(*hash, NodeIdx(i as u32));
+            num_ops[i] = *ops;
+        }
+        self.num_ops = num_ops.into_iter().collect();
+        self.pending = 0;
+        self.cache_fragments();
+        Ok(())
+    }
+
+    /// Each change's hash and op count, in this graph's order, for
+    /// [`ChangeGraph::fill_deferred_hashes`] on another copy.
+    pub(crate) fn hashes_and_op_counts(&self) -> Vec<(ChangeHash, u64)> {
+        self.require_hashes();
+        self.hashes
+            .iter()
+            .zip(self.num_ops.iter())
+            .map(|(hash, ops)| (*hash, ops))
+            .collect()
+    }
+
     pub(crate) fn hash_to_index(&self, hash: &ChangeHash) -> Option<usize> {
-        self.nodes_by_hash.get(hash).map(|n| n.0 as usize)
+        self.node_of(hash).map(|n| n.0 as usize)
     }
 
     pub(crate) fn index_to_hash(&self, index: usize) -> Option<&ChangeHash> {
-        self.hashes.get(index)
+        let hash = self.hashes.get(index)?;
+        assert!(self.hash_known(NodeIdx(index as u32)), "{DEFERRED}");
+        Some(hash)
     }
 
     pub(crate) fn max_op(&self) -> u64 {
@@ -316,23 +417,22 @@ impl ChangeGraph {
             })
             .ok()?;
         let node_idx = actor_indices[index];
-        self.hashes.get(node_idx.0 as usize).cloned()
+        Some(self.hash_of(node_idx))
     }
 
     pub(crate) fn deps_for_hash(&self, hash: &ChangeHash) -> impl Iterator<Item = ChangeHash> + '_ {
-        let node_idx = self.nodes_by_hash.get(hash);
+        let node_idx = self.node_of(hash);
         let mut edge_idx = node_idx.and_then(|n| self.parents[n.0 as usize]);
         std::iter::from_fn(move || {
             let this_edge_idx = edge_idx?;
             let edge = &self.edges[this_edge_idx.get()];
             edge_idx = edge.next;
-            let hash = self.hashes[edge.target.0 as usize];
-            Some(hash)
+            Some(self.hash_of(edge.target))
         })
     }
 
     pub(crate) fn has_change(&self, hash: &ChangeHash) -> bool {
-        self.nodes_by_hash.contains_key(hash)
+        self.node_of(hash).is_some()
     }
 
     pub(crate) fn get_bundle_metadata<I>(
@@ -343,11 +443,13 @@ impl ChangeGraph {
         I: IntoIterator<Item = ChangeHash>,
     {
         hashes.into_iter().map(|hash| {
-            let index = self
-                .nodes_by_hash
-                .get(&hash)
-                .cloned()
-                .ok_or(MissingDep(hash))?;
+            let index = self.node_of(&hash).ok_or(MissingDep(hash))?;
+            // As for `get_build_metadata`: under a deferred load, only a
+            // change made since, on known parents.
+            assert!(
+                self.pending == 0 || index.0 as usize >= self.pending,
+                "{DEFERRED}"
+            );
             let i = index.0 as usize;
             let actor = self.actors[i].into();
             let timestamp = self.timestamps.get(i).unwrap_or_default();
@@ -361,7 +463,7 @@ impl ChangeGraph {
 
             let deps = self
                 .parents(index)
-                .map(|p| self.hashes[p.0 as usize])
+                .map(|p| self.hash_of(p))
                 .collect::<Vec<_>>();
 
             let start_op = max_op - num_ops + 1;
@@ -390,13 +492,19 @@ impl ChangeGraph {
     {
         let indexes: Vec<_> = hashes
             .into_iter()
-            .map(|hash| {
-                self.nodes_by_hash
-                    .get(&hash)
-                    .cloned()
-                    .ok_or(MissingDep(hash))
-            })
+            .map(|hash| self.node_of(&hash).ok_or(MissingDep(hash)))
             .collect::<Result<_, _>>()?;
+        // A change is rebuilt with its dependencies' hashes, and its op
+        // count exact: under a deferred load, only a change made since,
+        // on known parents, has both.
+        if self.pending > 0 {
+            for index in &indexes {
+                assert!(index.0 as usize >= self.pending, "{DEFERRED}");
+                for parent in self.parents(*index) {
+                    assert!(self.hash_known(parent), "{DEFERRED}");
+                }
+            }
+        }
 
         Ok(self.get_build_metadata_for_indexes(indexes))
     }
@@ -474,6 +582,7 @@ impl ChangeGraph {
     }
 
     pub(crate) fn get_hashes(&self, have_deps: &[ChangeHash]) -> Cow<'_, [ChangeHash]> {
+        self.require_hashes();
         if have_deps.is_empty() {
             Cow::Borrowed(&self.hashes)
         } else {
@@ -492,6 +601,7 @@ impl ChangeGraph {
         &self,
         have_deps: &[ChangeHash],
     ) -> Vec<BuildChangeMetadata<'_>> {
+        self.require_hashes();
         let clock = self.seq_clock_for_heads(have_deps);
         let change_indexes = self.get_build_indexes(clock);
         self.get_build_metadata_for_indexes(change_indexes)
@@ -505,9 +615,8 @@ impl ChangeGraph {
         self.seq_index
             .get(actor)
             .and_then(|v| v.get(seq as usize - 1))
-            .and_then(|i| self.hashes.get(i.0 as usize))
+            .map(|i| self.hash_of(*i))
             .ok_or(AutomergeError::InvalidSeq(seq))
-            .copied()
     }
 
     fn update_heads(&mut self, change: &Change) {
@@ -583,6 +692,7 @@ impl ChangeGraph {
     }
 
     pub(crate) fn get_fragment(&self, head: ChangeHash) -> Option<Fragment> {
+        self.require_hashes();
         let n = self.nodes_by_hash.get(&head).copied()?;
         if head.fragment_level() == 0 {
             self.loose_commit(n)
@@ -616,6 +726,7 @@ impl ChangeGraph {
         heads: &'a [ChangeHash],
         levels: R,
     ) -> impl Iterator<Item = Fragment> + 'a {
+        self.require_hashes();
         let heads = if levels.contains(&0) { heads } else { &[] };
         self.loose_fragments(heads).chain(
             self.fragments
@@ -764,10 +875,10 @@ impl ChangeGraph {
     }
 
     pub(crate) fn deps(&self, hash: &ChangeHash) -> impl Iterator<Item = ChangeHash> + '_ {
-        let mut iter = self.nodes_by_hash.get(hash).map(|node| self.parents(*node));
+        let mut iter = self.node_of(hash).map(|node| self.parents(node));
         std::iter::from_fn(move || {
             let next = iter.as_mut()?.next()?;
-            self.hashes.get(next.0 as usize).copied()
+            Some(self.hash_of(next))
         })
     }
 
@@ -785,10 +896,7 @@ impl ChangeGraph {
         &self,
         heads: &'a [ChangeHash],
     ) -> impl Iterator<Item = NodeIdx> + use<'a, '_> {
-        heads
-            .iter()
-            .filter_map(|h| self.nodes_by_hash.get(h))
-            .copied()
+        heads.iter().filter_map(|h| self.node_of(h))
     }
 
     pub(crate) fn clock_at(&self, heads: &[ChangeHash]) -> Clock {
@@ -859,8 +967,7 @@ impl ChangeGraph {
     ) {
         let nodes = self.heads_to_nodes(heads);
         self.traverse_ancestors(nodes.collect(), |idx| {
-            let hash = &self.hashes[idx.0 as usize];
-            changes.remove(hash);
+            changes.remove(&self.hash_of(idx));
             true
         });
     }
@@ -888,6 +995,46 @@ impl ChangeGraphCols {
 
     pub(crate) fn iter(&self) -> ChangeIter<'_> {
         self.0.iter()
+    }
+
+    /// The graph of a document loaded without rebuilding its changes,
+    /// trusting its stored head: only the head's hash is known, the
+    /// others wait for [`ChangeGraph::fill_deferred_hashes`], and op
+    /// counts are the estimates [`ChangeGraphCols::load`] made. Gives
+    /// the columns back where the head's change can't be told from the
+    /// graph alone, which is wherever there is not exactly one head.
+    pub(crate) fn finalize_deferred(self, authors: &mut Authors) -> Result<ChangeGraph, Box<Self>> {
+        let len = self.0.len();
+        let mut has_child = vec![false; len];
+        for edge in &self.0.edges {
+            has_child[edge.target.0 as usize] = true;
+        }
+        let mut childless = (0..len).filter(|i| !has_child[*i]);
+        let (Some(head_index), None) = (childless.next(), childless.next()) else {
+            return Err(Box::new(self));
+        };
+        let mut heads = self.0.heads.iter();
+        let (Some(&head), None) = (heads.next(), heads.next()) else {
+            return Err(Box::new(self));
+        };
+        let mut graph = self.0;
+        graph.hashes = vec![ChangeHash([0; 32]); len];
+        graph.hashes[head_index] = head;
+        graph.nodes_by_hash.insert(head, NodeIdx(head_index as u32));
+        for i in 0..len {
+            let meta = graph.extra_bytes_meta.get(i).unwrap();
+            let range = meta.prefix() as usize..meta.total() as usize;
+            if let Some(author) = decode_author_footer(&graph.extra_bytes_raw[range]) {
+                authors.assign_author(author.into_owned(), graph.actors[i].into());
+            }
+        }
+        for n in 0..(len as u32) {
+            if (n + 1) % CACHE_STEP == 0 {
+                graph.cache_clock(NodeIdx(n));
+            }
+        }
+        graph.pending = len;
+        Ok(graph)
     }
 
     pub(crate) fn finalize(self, changes: &[Change], authors: &mut Authors) -> ChangeGraph {
@@ -1046,6 +1193,7 @@ impl ChangeGraphCols {
             seq_index,
             fragments,
             fragment_top,
+            pending: 0,
         }))
     }
 }
@@ -1053,6 +1201,32 @@ impl ChangeGraphCols {
 #[derive(Debug, thiserror::Error)]
 #[error("attempted to derive a clock for a change with dependencies we don't have")]
 pub struct MissingDep(ChangeHash);
+
+/// Why [`crate::Automerge::fill_deferred_hashes`] refused what it was given.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DeferredMismatch {
+    /// The changes given were too few for those deferred, or more than
+    /// the document has.
+    #[error("{got} change hashes for {expected} deferred changes")]
+    Length {
+        /// How many changes were loaded without their hashes.
+        expected: usize,
+        /// How many were given.
+        got: usize,
+    },
+    /// A hash given differs from one the document already knows, its
+    /// stored head's or a later change's: the stored head is not what
+    /// the document's ops rebuild into.
+    #[error("change {index} hashes to {got}, not {expected}")]
+    Hash {
+        /// The change's place in the document's order.
+        index: usize,
+        /// The hash the document holds for it.
+        expected: ChangeHash,
+        /// The hash given.
+        got: ChangeHash,
+    },
+}
 
 #[cfg(test)]
 mod tests {

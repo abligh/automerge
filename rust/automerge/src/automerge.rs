@@ -95,6 +95,7 @@ pub struct LoadOptions<'a> {
     patch_log: Option<&'a mut PatchLog>,
     text_encoding: TextEncoding,
     author: Option<Author<'static>>,
+    deferred_hashes: bool,
 }
 
 impl<'a> LoadOptions<'a> {
@@ -169,6 +170,29 @@ impl<'a> LoadOptions<'a> {
             ..self
         }
     }
+
+    /// Whether to trust a document chunk's stored head instead of
+    /// rebuilding every change to learn its hash.
+    ///
+    /// Rebuilding the changes is most of a large document's load. With
+    /// this, the load builds only the op index; the stored head's hash
+    /// is taken as given, and the others are unknown until
+    /// [`Automerge::fill_deferred_hashes`] fills them, from another copy
+    /// of the document loaded in full ([`Automerge::hashes_and_op_counts`]).
+    /// Until then, anything needing an unknown hash panics: sync,
+    /// history, `get_changes`, merging and applying changes. Local edits,
+    /// `save` and reading the document work. Nothing proves the ops
+    /// rebuild into the stored head until the hashes are filled, so the
+    /// caller must arrange that, whatever the verification mode.
+    ///
+    /// A chunk with other than one head is loaded in full, as without
+    /// this. The default is not to defer.
+    pub fn deferred_hashes(self, deferred_hashes: bool) -> Self {
+        Self {
+            deferred_hashes,
+            ..self
+        }
+    }
 }
 
 impl std::default::Default for LoadOptions<'static> {
@@ -180,6 +204,7 @@ impl std::default::Default for LoadOptions<'static> {
             string_migration: StringMigration::NoMigration,
             text_encoding: TextEncoding::platform_default(),
             author: None,
+            deferred_hashes: false,
         }
     }
 }
@@ -925,7 +950,11 @@ impl Automerge {
             storage::Chunk::Document(d) => {
                 tracing::trace!("first chunk is document chunk, inflating");
                 first_chunk_was_doc = true;
-                match d.reconstruct(options.verification_mode, options.text_encoding) {
+                match d.reconstruct(
+                    options.verification_mode,
+                    options.text_encoding,
+                    options.deferred_hashes,
+                ) {
                     Ok(doc) => doc,
                     Err(ReconstructError::InvalidMarkOrderDoc {
                         doc,
@@ -1628,6 +1657,38 @@ impl Automerge {
             _ => (),
         }
         acc.into_iter_no_unmark().collect()
+    }
+
+    /// Whether this document was loaded with
+    /// [`LoadOptions::deferred_hashes`] and its changes' hashes are not
+    /// yet filled.
+    pub fn hashes_deferred(&self) -> bool {
+        self.change_graph.hashes_deferred()
+    }
+
+    /// Each change's hash and op count, in this document's order, for
+    /// [`Automerge::fill_deferred_hashes`] on a copy loaded from this
+    /// document's [`Automerge::save`].
+    ///
+    /// # Panics
+    ///
+    /// If this document's own hashes are deferred.
+    pub fn hashes_and_op_counts(&self) -> Vec<(ChangeHash, u64)> {
+        self.change_graph.hashes_and_op_counts()
+    }
+
+    /// Fills the hashes a [`LoadOptions::deferred_hashes`] load left
+    /// out, from [`Automerge::hashes_and_op_counts`] of a full load of
+    /// the bytes this document saved, and so proves the stored head.
+    /// Every hash this document knows, the stored head's and those of
+    /// changes made since, must match what is given, or nothing is
+    /// filled and the hashes stay deferred. Does nothing to a document
+    /// whose hashes are not deferred.
+    pub fn fill_deferred_hashes(
+        &mut self,
+        changes: &[(ChangeHash, u64)],
+    ) -> Result<(), crate::DeferredMismatch> {
+        self.change_graph.fill_deferred_hashes(changes)
     }
 
     /// The whole document at its current heads, as

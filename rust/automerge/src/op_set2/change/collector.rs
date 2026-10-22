@@ -72,6 +72,28 @@ impl<'a> IndexedChangeCollector<'a> {
     }
 }
 
+/// Builds `index` from every op of `op_set`, as
+/// [`IndexedChangeCollector::process_ops`] does, without rebuilding the
+/// changes: for a load that trusts the stored heads and leaves the
+/// changes' hashes for later.
+pub(crate) fn index_ops(op_set: &OpSet, index: &mut IndexBuilder) -> Result<(), ReadOpError> {
+    let mut iter = op_set.iter();
+    let mut last = None;
+    while let Some(op) = iter.try_next()? {
+        let next = Some((op.obj, op.elemid_or_key()));
+        if last != next {
+            index.flush();
+            last = next;
+        }
+        index.process_op(&op);
+        let op_is_counter = op.is_counter();
+        for id in op.succ() {
+            index.process_succ(op_is_counter, id);
+        }
+    }
+    Ok(())
+}
+
 // TODO: the most memory efficient version of the ChangeCollector
 // would consume a change_meta_iter and an op_iter and itself be an iterator
 // that emits Change's.  This iterator could then be fed into a
