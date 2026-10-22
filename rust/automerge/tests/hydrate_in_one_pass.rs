@@ -2,6 +2,7 @@
 //! read what `hydrate` reads with no heads, for every kind of object
 //! and value, after deletions, overwrites, increments, merges with
 //! conflicts, and a save and load.
+use automerge::hydrate::Node;
 use automerge::marks::{ExpandMark, Mark};
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, ObjType, ReadDoc, ScalarValue, ROOT};
@@ -9,6 +10,32 @@ use automerge::{ActorId, AutoCommit, ObjType, ReadDoc, ScalarValue, ROOT};
 fn same(doc: &AutoCommit) {
     assert_eq!(doc.hydrate_in_one_pass(), doc.hydrate(&ROOT, None).unwrap());
     same_one_at_a_time(doc);
+    same_as_nodes(doc);
+}
+
+/// `take_gathered` builds the root, and each object under `nodes` from
+/// a gathering of its own, as `hydrate` gives it converted to a node.
+fn same_as_nodes(doc: &AutoCommit) {
+    let mut gathered = doc.gather_in_one_pass();
+    let root = doc.take_gathered(&mut gathered, &ROOT).unwrap();
+    assert_eq!(root, Node::from(&doc.hydrate(&ROOT, None).unwrap()));
+    let Some((_, nodes)) = doc.get(&ROOT, "nodes").unwrap() else {
+        return;
+    };
+    let mut gathered = doc.gather_in_one_pass();
+    for item in doc.map_range(&nodes, ..) {
+        let id = item.id();
+        if !matches!(item.value, automerge::ValueRef::Object(_)) {
+            continue;
+        }
+        let taken = doc.take_gathered(&mut gathered, &id).unwrap();
+        assert_eq!(
+            taken,
+            Node::from(&doc.hydrate(&id, None).unwrap()),
+            "{}",
+            item.key
+        );
+    }
 }
 
 /// Each object under `nodes`, built from one gathering in turn, is
@@ -127,4 +154,77 @@ fn a_loaded_document_reads_alike() {
 #[test]
 fn an_empty_document_reads_alike() {
     same(&AutoCommit::new());
+}
+
+/// Two actors setting the same map keys at once, to scalars and to
+/// objects, and keys deleted and set again: the tree picks the winner
+/// `hydrate` picks.
+#[test]
+fn concurrent_and_reset_keys_read_alike() {
+    let mut left = everything("aaaa");
+    let mut right = left.fork().with_actor(ActorId::from(b"bbbb".as_slice()));
+    let nodes = left.get(&ROOT, "nodes").unwrap().unwrap().1;
+    for i in 0..10 {
+        let key = format!("n{i:02}");
+        left.put(&nodes, &key, format!("left {i}")).unwrap();
+        if i % 2 == 0 {
+            let map = right.put_object(&nodes, &key, ObjType::Map).unwrap();
+            right.put(&map, "from", "right").unwrap();
+        } else {
+            right.put(&nodes, &key, i as i64).unwrap();
+        }
+    }
+    // Deleted on one side, set on the other.
+    left.delete(&nodes, "n20").unwrap();
+    right.put(&nodes, "n20", "set by right").unwrap();
+    // Deleted and set again on one side.
+    left.delete(&nodes, "n21").unwrap();
+    left.put(&nodes, "n21", "set again").unwrap();
+    let n22 = left.get(&nodes, "n22").unwrap().unwrap().1;
+    left.delete(&n22, "at").unwrap();
+    left.put(&n22, "at", 99).unwrap();
+    left.merge(&mut right).unwrap();
+    same(&left);
+    let mut loaded = AutoCommit::load(&left.save()).unwrap();
+    same(&loaded);
+    loaded.put(&ROOT, "pending", 1).unwrap();
+    same(&loaded);
+}
+
+/// A map's keys come out sorted as `str` sorts them, whatever their
+/// case, length or script, and `Node::from` sorts a hydrated map's.
+#[test]
+fn map_keys_come_out_sorted() {
+    let mut doc = AutoCommit::new();
+    let map = doc.put_object(&ROOT, "keys", ObjType::Map).unwrap();
+    let keys = [
+        "b",
+        "B",
+        "a",
+        "aa",
+        "é",
+        "Z",
+        "",
+        "a b",
+        "\u{1F600}",
+        "10",
+        "9",
+    ];
+    for (i, key) in keys.iter().enumerate() {
+        doc.put(&map, *key, i as i64).unwrap();
+    }
+    let mut sorted: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    sorted.sort();
+    for node in [
+        doc.take_gathered(&mut doc.gather_in_one_pass(), &map)
+            .unwrap(),
+        Node::from(&doc.hydrate(&map, None).unwrap()),
+    ] {
+        let Node::Map(entries) = node else {
+            panic!("a map");
+        };
+        let got: Vec<String> = entries.into_iter().map(|(key, _)| key).collect();
+        assert_eq!(got, sorted);
+    }
+    same(&doc);
 }

@@ -456,6 +456,16 @@ impl AutoCommit {
         self.doc.hydrate_gathered(gathered, obj)
     }
 
+    /// The object `obj` built from `gathered`, as
+    /// [`Automerge::take_gathered`] builds it.
+    pub fn take_gathered(
+        &self,
+        gathered: &mut hydrate::Gathered,
+        obj: &ExId,
+    ) -> Result<hydrate::Node, AutomergeError> {
+        self.doc.take_gathered(gathered, obj)
+    }
+
     pub fn get_actors_for_author(&self, author: &Author<'_>) -> Vec<ActorId> {
         self.doc.get_actors_for_author(author)
     }

@@ -27,6 +27,57 @@ pub enum Value {
     Text(Text),
 }
 
+/// A value as [`Gathered::take`] builds it: what [`Value`] holds for a
+/// reader that only reads it, with no hash map per map, no conflict
+/// flags and no marks.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Node {
+    /// A map's or table's entries. The keys are unique and in
+    /// ascending order as `str`'s `Ord` sorts them, which is the order
+    /// Automerge keeps map keys in, so a reader may binary search them.
+    Map(Vec<(String, Node)>),
+    /// A list's elements, in order.
+    List(Vec<Node>),
+    /// A scalar.
+    Scalar(ScalarValue),
+    /// A text object's characters.
+    Text(String),
+}
+
+impl Node {
+    /// A map of `entries`, which must be as [`Node::Map`] says: keys
+    /// unique and sorted (checked in debug builds).
+    fn map(entries: Vec<(String, Node)>) -> Self {
+        debug_assert!(
+            entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "map keys unique and sorted"
+        );
+        Node::Map(entries)
+    }
+}
+
+impl From<&Value> for Node {
+    /// The node holding what `value` holds: a map's entries sorted by
+    /// key, a text's characters, and neither conflict flags nor marks.
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Scalar(scalar) => Node::Scalar(scalar.clone()),
+            Value::Map(map) => {
+                let mut entries: Vec<(String, Node)> = map
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), Node::from(&entry.value)))
+                    .collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                Node::map(entries)
+            }
+            Value::List(list) => {
+                Node::List(list.iter().map(|entry| Node::from(&entry.value)).collect())
+            }
+            Value::Text(text) => Node::Text(text.to_string()),
+        }
+    }
+}
+
 impl Value {
     pub fn new<'a, V: Into<crate::Value<'a>>>(value: V, text_encoding: TextEncoding) -> Self {
         match value.into() {
@@ -403,6 +454,36 @@ impl Gathered {
     /// entries and, recursively, those of the objects they make, each
     /// taken out of the gathering. Text is read from `ops`. An object
     /// with no entries, or one already built, is empty.
+    /// The value of `obj`, of type `typ`, as [`Gathered::hydrate`]
+    /// builds it, but as a [`Node`]: its gathered entries and,
+    /// recursively, those of the objects they make, each taken out of
+    /// the gathering. Text is read from `ops`. An object with no
+    /// entries, or one already taken, is empty.
+    pub(crate) fn take(&mut self, ops: &OpSet, obj: &ObjId, typ: ObjType) -> Node {
+        if typ == ObjType::Text {
+            return Node::Text(ops.text(obj, None));
+        }
+        let entries = self.objects.remove(obj).unwrap_or_default();
+        let mut node = |slot| match slot {
+            Slot::Scalar(scalar) => Node::Scalar(scalar),
+            Slot::Object(child, typ) => self.take(ops, &child, typ),
+        };
+        match typ {
+            ObjType::Map | ObjType::Table => Node::map(
+                entries
+                    .into_iter()
+                    .map(|Entry { key, slot, .. }| (key.unwrap_or_default(), node(slot)))
+                    .collect(),
+            ),
+            ObjType::List | ObjType::Text => Node::List(
+                entries
+                    .into_iter()
+                    .map(|Entry { slot, .. }| node(slot))
+                    .collect(),
+            ),
+        }
+    }
+
     pub(crate) fn hydrate(
         &mut self,
         ops: &OpSet,
