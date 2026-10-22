@@ -450,10 +450,6 @@ impl Gathered {
         self.objects.is_empty()
     }
 
-    /// The value of `obj`, of type `typ`, built from its gathered
-    /// entries and, recursively, those of the objects they make, each
-    /// taken out of the gathering. Text is read from `ops`. An object
-    /// with no entries, or one already built, is empty.
     /// The value of `obj`, of type `typ`, as [`Gathered::hydrate`]
     /// builds it, but as a [`Node`]: its gathered entries and,
     /// recursively, those of the objects they make, each taken out of
@@ -484,6 +480,10 @@ impl Gathered {
         }
     }
 
+    /// The value of `obj`, of type `typ`, built from its gathered
+    /// entries and, recursively, those of the objects they make, each
+    /// taken out of the gathering. Text is read from `ops`. An object
+    /// with no entries, or one already built, is empty.
     pub(crate) fn hydrate(
         &mut self,
         ops: &OpSet,
