@@ -4448,3 +4448,78 @@ fn patches_expose_surviving_conflict_after_deleting_other_branch_from_fuzz_trace
         .unwrap();
     assert_eq!(actual, expected);
 }
+
+// A transaction under an actor the document has not seen enters that actor
+// into the actor table, shifting the indices of the actors that sort after
+// it. If the transaction then ends with no ops (an empty commit or a
+// rollback) the actor is removed again and those indices shift back. The
+// mark index has to follow both moves: if it keeps the shifted ids, a mark
+// later merged from the actor that now holds the stale index collides with
+// an existing mark, and the document reports the wrong mark.
+#[test]
+fn marks_survive_an_actor_added_and_removed_by_an_empty_transaction() {
+    for rollback in [false, true] {
+        let alice = ActorId::from([2u8; 16]);
+        let bob = ActorId::from([3u8; 16]);
+        // sorts before both, so entering it shifts alice's index
+        let early = ActorId::from([1u8; 16]);
+
+        let mut doc = AutoCommit::new().with_actor(alice.clone());
+        let text = doc.put_object(ROOT, "text", ObjType::Text).unwrap();
+        doc.splice_text(&text, 0, 0, "abcdefgh").unwrap();
+        doc.commit();
+        let mut other = doc.fork().with_actor(bob);
+
+        // concurrent marks with the same counter: 8@alice and 8@bob
+        doc.mark(
+            &text,
+            Mark::new("bold".into(), "true", 1, 3),
+            ExpandMark::After,
+        )
+        .unwrap();
+        doc.commit();
+        other
+            .mark(
+                &text,
+                Mark::new("link".into(), "x", 5, 7),
+                ExpandMark::After,
+            )
+            .unwrap();
+        other.commit();
+
+        // a no-op edit opens a transaction under `early`, which ends empty
+        doc.set_actor(early.clone());
+        doc.splice_text(&text, 0, 0, "").unwrap();
+        if rollback {
+            doc.rollback();
+        } else {
+            doc.commit();
+        }
+        doc.set_actor(alice.clone());
+
+        doc.merge(&mut other).unwrap();
+        let expected = vec![
+            Mark::new("bold".into(), "true", 1, 3),
+            Mark::new("link".into(), "x", 5, 7),
+        ];
+        assert_eq!(doc.marks(&text).unwrap(), expected, "rollback: {rollback}");
+
+        // text typed at the end of the bold span takes on bold
+        doc.splice_text(&text, 3, 0, "X").unwrap();
+        doc.commit();
+        let marks = doc.get_marks(&text, 3, None).unwrap();
+        assert_eq!(
+            marks.iter().collect::<Vec<_>>(),
+            vec![("bold", &ScalarValue::from("true"))],
+            "rollback: {rollback}"
+        );
+
+        // and a document loaded from the same changes agrees
+        let loaded = AutoCommit::load(&doc.save()).unwrap();
+        assert_eq!(
+            doc.marks(&text).unwrap(),
+            loaded.marks(&text).unwrap(),
+            "rollback: {rollback}"
+        );
+    }
+}
