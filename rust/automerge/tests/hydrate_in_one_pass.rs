@@ -228,3 +228,43 @@ fn map_keys_come_out_sorted() {
     }
     same(&doc);
 }
+
+/// A document with no deleted or replaced objects: building the root takes
+/// every gathered object out, block maps inside text, and the objects in
+/// them, included.
+#[test]
+fn building_the_root_takes_everything() {
+    let mut doc = AutoCommit::new().with_actor(ActorId::from(b"blocks".as_slice()));
+    let map = doc.put_object(&ROOT, "map", ObjType::Map).unwrap();
+    doc.put(&map, "x", 1).unwrap();
+    let list = doc.put_object(&map, "list", ObjType::List).unwrap();
+    doc.insert(&list, 0, "a").unwrap();
+    doc.insert_object(&list, 1, ObjType::Map).unwrap();
+    let text = doc.put_object(&ROOT, "text", ObjType::Text).unwrap();
+    doc.splice_text(&text, 0, 0, "hello world").unwrap();
+    // Block maps are objects inside the text, with objects of their own.
+    for at in [5, 0] {
+        let block = doc.split_block(&text, at).unwrap();
+        doc.put(&block, "type", "paragraph").unwrap();
+        let parents = doc.put_object(&block, "parents", ObjType::List).unwrap();
+        doc.insert(&parents, 0, "quote").unwrap();
+        doc.put_object(&block, "attrs", ObjType::Map).unwrap();
+    }
+    doc.mark(
+        &text,
+        Mark::new("bold".to_owned(), true, 0, 3),
+        ExpandMark::After,
+    )
+    .unwrap();
+    doc.commit();
+    same(&doc);
+
+    let mut gathered = doc.gather_in_one_pass();
+    assert!(!gathered.is_empty());
+    doc.hydrate_gathered(&mut gathered, &ROOT).unwrap();
+    assert!(gathered.is_empty(), "{} objects left", gathered.len());
+
+    let mut gathered = doc.gather_in_one_pass();
+    doc.take_gathered(&mut gathered, &ROOT).unwrap();
+    assert!(gathered.is_empty(), "{} objects left", gathered.len());
+}
