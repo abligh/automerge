@@ -66,7 +66,10 @@ impl<T: compression::ColumnCompression> RawColumn<T> {
         } else {
             let mut deflater = flate2::bufread::DeflateEncoder::new(
                 &input[self.data.clone()],
-                flate2::Compression::default(),
+                // Level 2: about half level 6's time for a few percent
+                // more bytes, and any level reads back alike (galatea
+                // issue 5410).
+                flate2::Compression::new(2),
             );
             //This unwrap should be okay as we're reading and writing to in memory buffers
             (self.spec.deflated(), deflater.read_to_end(out).unwrap())
