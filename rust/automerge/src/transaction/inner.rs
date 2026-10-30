@@ -361,6 +361,8 @@ impl TransactionInner {
                 .last()
                 .is_some_and(|op| op.action == Action::Set && &op.value == v),
             OpType::Increment(_) => query.ops.iter().any(|op| op.is_counter()),
+            // a new object always writes
+            OpType::Make(_) => true,
             _ => false,
         };
         if !plain {
@@ -1567,6 +1569,73 @@ impl TransactionInner {
         batch.finish();
 
         Ok(doc.id_to_exid(root_id))
+    }
+
+    /// See [`Transactable::batch_create_objects`](crate::transaction::Transactable::batch_create_objects).
+    ///
+    /// Each key's make op is recorded as [`Self::batch_write`] records a
+    /// put and lands with the others in one pass per column; then one
+    /// [`BatchInsertion`] appends every object's contents, breadth first
+    /// across all of them, which is the op set's order since every new
+    /// object's id follows every existing one's.
+    pub(crate) fn batch_create_objects(
+        &mut self,
+        doc: &mut Automerge,
+        patch_log: &mut PatchLog,
+        ex_parent: &ExId,
+        entries: &[(String, hydrate::Value)],
+    ) -> Result<Vec<ExId>, AutomergeError> {
+        let parent = self.exid_to_obj(doc, ex_parent)?;
+        if !matches!(parent.typ, ObjType::Map | ObjType::Table) {
+            return Err(AutomergeError::InvalidOp(parent.typ));
+        }
+        let types = entries
+            .iter()
+            .map(|(_, value)| match value {
+                hydrate::Value::Map(_) => Ok(ObjType::Map),
+                hydrate::Value::List(_) => Ok(ObjType::List),
+                hydrate::Value::Text(_) => Ok(ObjType::Text),
+                hydrate::Value::Scalar(_) => Err(AutomergeError::NotAnObject),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut roots = Vec::with_capacity(entries.len());
+        let mut batch = Batch::default();
+        for ((key, value), typ) in entries.iter().zip(types) {
+            if batch.holds(&parent.id, key) {
+                self.flush(doc, &mut batch);
+            }
+            let action = OpType::Make(typ);
+            let id = match self.record_map_op(
+                doc,
+                patch_log,
+                &parent,
+                key.clone(),
+                action,
+                &mut batch,
+            ) {
+                Ok(id) => id,
+                Err((key, action)) => {
+                    self.flush(doc, &mut batch);
+                    self.local_map_op(doc, patch_log, &parent, key, action)?
+                        .expect("a new object always writes")
+                }
+            };
+            let meta = ObjMeta {
+                id: crate::types::ObjId(id),
+                typ,
+            };
+            roots.push((meta, value));
+        }
+        self.flush(doc, &mut batch);
+        let mut queue: VecDeque<(ObjMeta, &hydrate::Value)> = roots.iter().copied().collect();
+        let insert_pos = doc.ops().len();
+        let mut insertion = BatchInsertion::new(self, doc, patch_log, insert_pos);
+        batch_bfs(&mut insertion, &mut queue)?;
+        insertion.finish();
+        Ok(roots
+            .iter()
+            .map(|(meta, _)| doc.id_to_exid(meta.id.0))
+            .collect())
     }
 
     /// Initialize the root object of an empty document from a `hydrate::Map`.

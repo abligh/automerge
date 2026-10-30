@@ -521,6 +521,16 @@ macro_rules! impl_transactable_for_tx {
                 })
             }
 
+            fn batch_create_objects<O: AsRef<ExId>>(
+                &mut self,
+                obj: O,
+                entries: &[(String, crate::hydrate::Value)],
+            ) -> Result<Vec<ExId>, crate::AutomergeError> {
+                self.do_tx(move |tx, doc, hist| {
+                    tx.batch_create_objects(doc, hist, obj.as_ref(), entries)
+                })
+            }
+
             fn batch_create_object<O: AsRef<ExId>, P: Into<crate::Prop>>(
                 &mut self,
                 obj: O,
