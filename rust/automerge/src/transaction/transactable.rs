@@ -201,6 +201,29 @@ pub trait Transactable: ReadDoc {
         writes: I,
     ) -> Result<Vec<Option<ExId>>, AutomergeError>;
 
+    /// Put each of `entries`, a key and a map, list or text value, into
+    /// the map `obj` as a new object tree, as [`Self::batch_create_object`]
+    /// does for one.
+    ///
+    /// The document is what the same calls to `batch_create_object`, in
+    /// that order, would leave, but every key's object is made before
+    /// any of their contents, so the ops' ids differ. The cost differs
+    /// too: the keys' ops land in the op set in one pass per column, as
+    /// [`Self::batch_write`]'s do, and every object's contents in one
+    /// append, rather than two splices an entry. A key given twice is
+    /// written twice, the later winning. Returns each entry's new
+    /// object.
+    ///
+    /// Refused, writing nothing, with [`AutomergeError::NotAnObject`]
+    /// where an entry is a scalar; with [`AutomergeError::InvalidOp`]
+    /// where `obj` is not a map. Patches are logged for every key, then
+    /// for the objects' contents.
+    fn batch_create_objects<O: AsRef<ExId>>(
+        &mut self,
+        obj: O,
+        entries: &[(String, crate::hydrate::Value)],
+    ) -> Result<Vec<ExId>, AutomergeError>;
+
     /// Put or insert a nested `hydrate::Value` as a new object tree using
     /// batch operations.
     ///

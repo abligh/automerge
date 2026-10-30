@@ -1063,3 +1063,184 @@ fn batch_create_object_rejects_map_key_in_text() {
         automerge::AutomergeError::InvalidOp(ObjType::Text)
     ));
 }
+
+/// Entries `range`, keyed so that they interleave with the keys
+/// `seeded` writes: each a map holding scalars, a nested map, a list of
+/// maps and a text.
+fn objects(range: std::ops::Range<usize>) -> Vec<(String, hydrate::Value)> {
+    range
+        .map(|n| {
+            let value = hydrate::Value::Map(hydrate_map! {
+                "type" => "path",
+                "n" => n as i64,
+                "at" => hydrate_map! { "parent" => "layer", "pos" => ScalarValue::from(format!("a{n}")) },
+                "points" => hydrate_list![
+                    hydrate_map! { "x" => n as i64, "y" => 1_i64 },
+                    hydrate_map! { "x" => 2_i64, "y" => n as i64 },
+                ],
+                "label" => hydrate_text!(format!("node {n}").as_str()),
+            });
+            (format!("k{:05}", n * 2 + 1), value)
+        })
+        .collect()
+}
+
+/// A document whose map `nodes` holds `count` keys, as objects and
+/// scalars, committed, and the map's id.
+fn seeded(count: usize) -> (AutoCommit, automerge::ObjId) {
+    let mut doc = AutoCommit::new();
+    let nodes = doc.put_object(ROOT, "nodes", ObjType::Map).unwrap();
+    for n in 0..count {
+        let key = format!("k{:05}", n * 2);
+        if n % 3 == 0 {
+            doc.put(&nodes, key, n as i64).unwrap();
+        } else {
+            let obj = doc.put_object(&nodes, key, ObjType::Map).unwrap();
+            doc.put(&obj, "n", n as i64).unwrap();
+        }
+    }
+    doc.commit();
+    (doc, nodes)
+}
+
+/// Writes `entries` into `nodes` one `batch_create_object` call each.
+fn one_by_one(
+    doc: &mut AutoCommit,
+    nodes: &automerge::ObjId,
+    entries: &[(String, hydrate::Value)],
+) -> Vec<automerge::ObjId> {
+    entries
+        .iter()
+        .map(|(key, value)| {
+            doc.batch_create_object(nodes, key.as_str(), value, false)
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Checks that `batch` and `each` hold the same document, as they are
+/// and as saved and loaded, and as a peer that had neither's writes
+/// merges them.
+fn same_document(batch: &mut AutoCommit, each: &mut AutoCommit, before: &mut AutoCommit) {
+    let hydrated = batch.hydrate(ROOT, None).unwrap();
+    assert_eq!(hydrated, each.hydrate(ROOT, None).unwrap());
+    let loaded = AutoCommit::load(&batch.save()).unwrap();
+    assert_eq!(loaded.hydrate(ROOT, None).unwrap(), hydrated);
+    let mut peer = before.fork();
+    peer.merge(batch).unwrap();
+    assert_eq!(peer.hydrate(ROOT, None).unwrap(), hydrated);
+}
+
+/// `batch_create_objects` leaves what one `batch_create_object` call
+/// a key would: new keys between existing ones, keys holding objects
+/// and scalars overwritten, and a key given twice, the later winning.
+#[test]
+fn batch_create_objects_leaves_what_a_call_a_key_would() {
+    let (mut before, nodes) = seeded(600);
+    let mut entries = objects(0..400);
+    for (n, (_, value)) in objects(400..410).into_iter().enumerate() {
+        entries.push((format!("k{:05}", n * 2), value));
+    }
+    let twice = entries[7].0.clone();
+    entries.push((twice.clone(), objects(999..1000).remove(0).1));
+    let mut batch = before.fork();
+    let made = batch.batch_create_objects(&nodes, &entries).unwrap();
+    let mut each = before.fork();
+    one_by_one(&mut each, &nodes, &entries);
+    assert_eq!(made.len(), entries.len());
+    for ((key, _), obj) in entries.iter().zip(&made) {
+        if key != &twice {
+            assert_eq!(batch.get(&nodes, key).unwrap().unwrap().1, *obj, "{key}");
+        }
+    }
+    assert_eq!(
+        batch.get(&nodes, &twice).unwrap().unwrap().1,
+        made[made.len() - 1],
+        "the later write wins"
+    );
+    batch.commit();
+    each.commit();
+    same_document(&mut batch, &mut each, &mut before);
+}
+
+/// Into an empty map, and into one of a document with no other ops.
+#[test]
+fn batch_create_objects_into_an_empty_map() {
+    let (mut before, nodes) = seeded(0);
+    let entries = objects(0..50);
+    let mut batch = before.fork();
+    batch.batch_create_objects(&nodes, &entries).unwrap();
+    let mut each = before.fork();
+    one_by_one(&mut each, &nodes, &entries);
+    same_document(&mut batch, &mut each, &mut before);
+    let mut fresh = AutoCommit::new();
+    fresh.batch_create_objects(ROOT, &entries).unwrap();
+    let mut fresh_each = AutoCommit::new();
+    one_by_one(&mut fresh_each, &ROOT, &entries);
+    assert_eq!(
+        fresh.hydrate(ROOT, None).unwrap(),
+        fresh_each.hydrate(ROOT, None).unwrap()
+    );
+    assert!(batch.batch_create_objects(&nodes, &[]).unwrap().is_empty());
+}
+
+/// A scalar entry, or a parent that is not a map, is refused before
+/// anything is written.
+#[test]
+fn batch_create_objects_refuses_writing_nothing() {
+    let (mut doc, nodes) = seeded(10);
+    let mut entries = objects(0..5);
+    entries.push(("scalar".into(), hydrate::Value::from(1_i64)));
+    let heads = doc.get_heads();
+    assert!(matches!(
+        doc.batch_create_objects(&nodes, &entries),
+        Err(automerge::AutomergeError::NotAnObject)
+    ));
+    let list = doc.put_object(ROOT, "list", ObjType::List).unwrap();
+    let pending = doc.pending_ops();
+    assert!(matches!(
+        doc.batch_create_objects(&list, &objects(0..2)),
+        Err(automerge::AutomergeError::InvalidOp(ObjType::List))
+    ));
+    assert_eq!(doc.pending_ops(), pending, "nothing written");
+    doc.commit();
+    assert_eq!(doc.get_changes(&heads).len(), 1, "only the list");
+    assert!(doc.get(&nodes, "k00001").unwrap().is_none());
+}
+
+/// A transaction rolled back takes every object made out again.
+#[test]
+fn batch_create_objects_rolls_back() {
+    let (seed, nodes) = seeded(100);
+    let mut doc = automerge::Automerge::load(&seed.clone().save()).unwrap();
+    let hydrated = doc.hydrate(None);
+    {
+        let mut tx = doc.transaction();
+        tx.batch_create_objects(&nodes, &objects(0..60)).unwrap();
+        assert!(tx.get(&nodes, "k00001").unwrap().is_some());
+        tx.rollback();
+    }
+    assert_eq!(doc.hydrate(None), hydrated);
+    let mut tx = doc.transaction();
+    tx.batch_create_objects(&nodes, &objects(0..60)).unwrap();
+    tx.commit();
+    assert_eq!(
+        doc.get(&nodes, "k00119").unwrap().unwrap().0,
+        Value::Object(ObjType::Map)
+    );
+}
+
+/// The patches a diff gives over the writes take the document before
+/// to the document after.
+#[test]
+fn batch_create_objects_patches_reach_the_document() {
+    let (mut doc, nodes) = seeded(40);
+    let mut hydrated = doc.hydrate(ROOT, None).unwrap();
+    doc.update_diff_cursor();
+    doc.batch_create_objects(&nodes, &objects(0..30)).unwrap();
+    let patches = doc.diff_incremental();
+    hydrated
+        .apply_patches(doc.text_encoding(), patches)
+        .unwrap();
+    assert_eq!(hydrated, doc.hydrate(ROOT, None).unwrap());
+}
