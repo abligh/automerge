@@ -1387,6 +1387,16 @@ impl SyncDoc for SyncWrapper<'_> {
         self.inner.doc.generate_sync_message(sync_state)
     }
 
+    fn generate_sync_message_within(
+        &self,
+        sync_state: &mut sync::State,
+        budget: usize,
+    ) -> Option<sync::Message> {
+        self.inner
+            .doc
+            .generate_sync_message_within(sync_state, budget)
+    }
+
     fn receive_sync_message(
         &mut self,
         sync_state: &mut sync::State,

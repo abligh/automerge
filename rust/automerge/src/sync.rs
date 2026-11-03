@@ -106,6 +106,27 @@ pub trait SyncDoc {
     /// * `patch_log` - A [`PatchLog`] which will be updated with any changes that are made to the current state of the document due to the received sync message
     fn generate_sync_message(&self, sync_state: &mut State) -> Option<Message>;
 
+    /// As [`Self::generate_sync_message`], but the changes the message
+    /// carries total at most `budget` bytes, encoded: they are taken in
+    /// the order [`Self::generate_sync_message`] would send them, which
+    /// is dependency order, while they fit, and always at least one, so
+    /// a single change larger than `budget` is sent alone. Only those
+    /// are recorded as sent, so the rounds that follow send the rest.
+    /// The whole document is sent in their place, as
+    /// [`Self::generate_sync_message`] may, only where it fits
+    /// `budget`.
+    ///
+    /// The provided implementation ignores `budget`; [`Automerge`] and
+    /// [`crate::AutoCommit`]'s [`crate::AutoCommit::sync`] honor it.
+    fn generate_sync_message_within(
+        &self,
+        sync_state: &mut State,
+        budget: usize,
+    ) -> Option<Message> {
+        let _ = budget;
+        self.generate_sync_message(sync_state)
+    }
+
     /// Apply a received sync message to this document and `sync_state`
     fn receive_sync_message(
         &mut self,
@@ -163,8 +184,15 @@ impl MessageVersion {
     }
 }
 
-impl SyncDoc for Automerge {
-    fn generate_sync_message(&self, sync_state: &mut State) -> Option<Message> {
+impl Automerge {
+    /// [`SyncDoc::generate_sync_message`], its changes within `budget`
+    /// bytes where that is `Some`, as
+    /// [`SyncDoc::generate_sync_message_within`] says.
+    fn generate_sync_message_inner(
+        &self,
+        sync_state: &mut State,
+        budget: Option<usize>,
+    ) -> Option<Message> {
         let our_heads = self.get_heads();
 
         let our_need = if sync_state.read_only {
@@ -212,7 +240,16 @@ impl SyncDoc for Automerge {
         } else if let Some((their_have, their_need)) = sync_state.their() {
             if sync_state.send_doc() {
                 let hashes = self.change_graph.get_hashes(&[]);
-                MessageBuilder::new_v2(self.save(), hashes)
+                match budget {
+                    None => MessageBuilder::new_v2(self.save(), hashes),
+                    Some(budget) => {
+                        let unsent = (hashes.iter())
+                            .filter(|hash| !sync_state.sent_hashes.contains(hash))
+                            .copied()
+                            .collect();
+                        self.message_within(sync_state, unsent, true, budget)?
+                    }
+                }
             } else {
                 let all_hashes = self
                     .get_hashes_to_send(their_have, their_need)
@@ -222,13 +259,19 @@ impl SyncDoc for Automerge {
                     .into_iter()
                     .filter(|hash| !sync_state.sent_hashes.contains(hash))
                     .collect();
-                if hashes.len() > self.change_graph.len() / 3 && sync_state.supports_v2_messages() {
-                    // sending more than a 1/3 of the document?  send everything
-                    let all_hashes = self.change_graph.get_hashes(&[]);
-                    MessageBuilder::new_v2(self.save(), all_hashes)
-                } else {
-                    let changes = self.get_changes_by_hashes(hashes.iter().copied()).ok()?;
-                    MessageBuilder::new(changes, sync_state)
+                // sending more than a 1/3 of the document?  send everything
+                let whole =
+                    hashes.len() > self.change_graph.len() / 3 && sync_state.supports_v2_messages();
+                match budget {
+                    Some(budget) => self.message_within(sync_state, hashes, whole, budget)?,
+                    None if whole => {
+                        let all_hashes = self.change_graph.get_hashes(&[]);
+                        MessageBuilder::new_v2(self.save(), all_hashes)
+                    }
+                    None => {
+                        let changes = self.get_changes_by_hashes(hashes.iter().copied()).ok()?;
+                        MessageBuilder::new(changes, sync_state)
+                    }
                 }
             }
         } else {
@@ -285,6 +328,57 @@ impl SyncDoc for Automerge {
 
         sync_state.in_flight = true;
         Some(sync_message)
+    }
+
+    /// The changes `hashes`, in their order, while they total at most
+    /// `budget` bytes, and at least the first; or, where `whole` and it
+    /// fits `budget`, the whole document in their place. Saving the
+    /// document to learn its size costs a save each round that tries
+    /// it; the sender of a document larger than `budget` pays that once
+    /// a round until a third of it is left to send.
+    fn message_within(
+        &self,
+        sync_state: &State,
+        hashes: Vec<ChangeHash>,
+        whole: bool,
+        budget: usize,
+    ) -> Option<MessageBuilder<'_>> {
+        if whole {
+            let doc = self.save();
+            if doc.len() <= budget {
+                return Some(MessageBuilder::new_v2(
+                    doc,
+                    self.change_graph.get_hashes(&[]),
+                ));
+            }
+        }
+        let mut changes = self.get_changes_by_hashes(hashes).ok()?;
+        let mut used = 0;
+        let mut keep = 0;
+        for change in &changes {
+            let len = change.raw_bytes().len();
+            if keep > 0 && used + len > budget {
+                break;
+            }
+            used += len;
+            keep += 1;
+        }
+        changes.truncate(keep);
+        Some(MessageBuilder::new(changes, sync_state))
+    }
+}
+
+impl SyncDoc for Automerge {
+    fn generate_sync_message(&self, sync_state: &mut State) -> Option<Message> {
+        self.generate_sync_message_inner(sync_state, None)
+    }
+
+    fn generate_sync_message_within(
+        &self,
+        sync_state: &mut State,
+        budget: usize,
+    ) -> Option<Message> {
+        self.generate_sync_message_inner(sync_state, Some(budget))
     }
 
     fn receive_sync_message(
@@ -2491,5 +2585,163 @@ mod tests {
         // A should now have B's changes
         assert!(a.get(crate::ROOT, "from_b").unwrap().is_some());
         assert_eq!(a.get_heads(), b.get_heads());
+    }
+
+    /// `len` bytes that do not compress, from `seed`.
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// A document of `count` changes, each putting `len` bytes of noise.
+    fn noisy(count: u64, len: usize) -> crate::AutoCommit {
+        let mut doc = crate::AutoCommit::new();
+        for i in 0..count {
+            let bytes = crate::ScalarValue::Bytes(noise(i + 1, len));
+            doc.put(crate::ROOT, format!("blob{i}"), bytes).unwrap();
+            doc.commit();
+        }
+        doc
+    }
+
+    /// Syncs `a` and `b`, each with its budget where it has one, and
+    /// returns each message's encoded size and the number of change
+    /// chunks it carried.
+    fn sync_within(
+        a: &mut crate::AutoCommit,
+        b: &mut crate::AutoCommit,
+        budgets: (Option<usize>, Option<usize>),
+    ) -> Vec<(usize, usize)> {
+        let generate = |doc: &mut crate::AutoCommit, state: &mut State, budget| match budget {
+            Some(budget) => doc.sync().generate_sync_message_within(state, budget),
+            None => doc.sync().generate_sync_message(state),
+        };
+        let (mut a_state, mut b_state) = (State::new(), State::new());
+        let mut sent = Vec::new();
+        for _ in 0..20 {
+            let a_to_b = generate(a, &mut a_state, budgets.0);
+            let b_to_a = generate(b, &mut b_state, budgets.1);
+            if a_to_b.is_none() && b_to_a.is_none() {
+                return sent;
+            }
+            for (msg, doc, state) in [
+                (a_to_b, &mut *b, &mut b_state),
+                (b_to_a, &mut *a, &mut a_state),
+            ] {
+                if let Some(msg) = msg {
+                    sent.push((msg.clone().encode().len(), msg.changes.0.len()));
+                    doc.sync().receive_sync_message(state, msg).unwrap();
+                }
+            }
+        }
+        panic!("no convergence in 20 rounds: {sent:?}");
+    }
+
+    /// Three changes of 30 KiB each, with a budget of 32 KiB, scaled
+    /// down from Galatea's 30 MiB and 32 MiB (designs/0187).
+    const PART: usize = 30 * 1024;
+    const BUDGET: usize = 32 * 1024;
+
+    /// The most a message adds to its changes: heads, need, have and
+    /// flags, for these few changes.
+    const OVERHEAD: usize = 1024;
+
+    #[test]
+    fn budgeted_peers_converge_with_every_message_within_the_budget() {
+        let mut a = noisy(3, PART);
+        let mut b = crate::AutoCommit::new();
+        let sent = sync_within(&mut a, &mut b, (Some(BUDGET), Some(BUDGET)));
+        assert_eq!(a.get_heads(), b.get_heads());
+        assert!(
+            sent.iter().all(|(len, _)| *len <= BUDGET + OVERHEAD),
+            "{sent:?}"
+        );
+        // Each change went in a message of its own. The first goes
+        // twice: the peer's first message, sent before it had any,
+        // crosses it, and an empty peer is sent everything again.
+        let carrying: Vec<_> = sent.iter().filter(|(_, chunks)| *chunks > 0).collect();
+        assert!(carrying.iter().all(|(_, chunks)| *chunks == 1), "{sent:?}");
+        assert_eq!(carrying.len(), 4, "{sent:?}");
+        for i in 0..3u64 {
+            let (value, _) = b.get(crate::ROOT, format!("blob{i}")).unwrap().unwrap();
+            assert_eq!(value.as_bytes(), Some(&noise(i + 1, PART)[..]));
+        }
+    }
+
+    #[test]
+    fn a_budgeted_sender_and_an_unbudgeted_receiver_converge() {
+        let mut a = noisy(3, PART);
+        let mut b = noisy(1, 10);
+        b.put(crate::ROOT, "from_b", "x").unwrap();
+        b.commit();
+        let sent = sync_within(&mut a, &mut b, (Some(BUDGET), None));
+        assert_eq!(a.get_heads(), b.get_heads());
+        assert!(a.get(crate::ROOT, "from_b").unwrap().is_some());
+        // The receiver's own changes are small; every message fits.
+        assert!(
+            sent.iter().all(|(len, _)| *len <= BUDGET + OVERHEAD),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_larger_than_the_budget_is_sent_alone() {
+        let mut a = noisy(3, PART);
+        let mut b = crate::AutoCommit::new();
+        let sent = sync_within(&mut a, &mut b, (Some(100), Some(100)));
+        assert_eq!(a.get_heads(), b.get_heads());
+        let carrying: Vec<_> = sent.iter().filter(|(_, chunks)| *chunks > 0).collect();
+        assert!(carrying.iter().all(|(_, chunks)| *chunks == 1), "{sent:?}");
+        assert_eq!(carrying.len(), 4, "{sent:?}");
+    }
+
+    /// Where everything fits, the budget changes no message: the small
+    /// document still goes whole to a peer that has nothing, and a few
+    /// changes as changes.
+    #[test]
+    fn a_budget_everything_fits_changes_no_message() {
+        let messages = |budget: Option<usize>| {
+            let mut a = noisy(4, 100);
+            let mut b = crate::AutoCommit::new();
+            b.put(crate::ROOT, "b", 1).unwrap();
+            b.commit();
+            let mut out = sync_within(&mut a, &mut b, (budget, budget));
+            assert_eq!(a.get_heads(), b.get_heads());
+            for i in 0..3 {
+                a.put(crate::ROOT, "more", i).unwrap();
+                a.commit();
+                out.extend(sync_within(&mut a, &mut b, (budget, budget)));
+            }
+            out
+        };
+        assert_eq!(messages(Some(BUDGET)), messages(None));
+    }
+
+    /// The whole document is not sent where it would pass the budget,
+    /// though the peer has nothing and a v2 message could carry it.
+    #[test]
+    fn the_whole_document_goes_only_within_the_budget() {
+        let mut a = noisy(3, PART);
+        let mut a_state = State::new();
+        let mut b = crate::AutoCommit::new();
+        let mut b_state = State::new();
+        let hello = b.sync().generate_sync_message(&mut b_state).unwrap();
+        a.sync().receive_sync_message(&mut a_state, hello).unwrap();
+        assert!(a_state.send_doc());
+        let budgeted = a
+            .sync()
+            .generate_sync_message_within(&mut a_state.clone(), BUDGET)
+            .unwrap();
+        assert_eq!(budgeted.changes.0.len(), 1);
+        assert!(budgeted.encode().len() <= BUDGET + OVERHEAD);
+        let whole = a.sync().generate_sync_message(&mut a_state).unwrap();
+        assert!(whole.encode().len() > 3 * PART);
     }
 }
