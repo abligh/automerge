@@ -1624,6 +1624,69 @@ impl Automerge {
         Ok(self.calculate_marks_slow(&obj, clock, seq_type))
     }
 
+    /// The marks on the character at `index` of the text `obj`, `index`
+    /// counted in the document's text encoding as
+    /// [`Automerge::splice_text`] counts it; empty past the text's end or
+    /// for an object that is not a text. At the current heads they come
+    /// from the text and mark indexes, where [`ReadDoc::get_marks`]
+    /// walks every op before the character, and counts elements rather
+    /// than units (galatea issue 14404).
+    pub fn text_marks_at<O: AsRef<ExId>>(
+        &self,
+        obj: O,
+        index: usize,
+    ) -> Result<MarkSet, AutomergeError> {
+        self.text_marks_at_for(obj.as_ref(), index, None)
+    }
+
+    pub(crate) fn text_marks_at_for(
+        &self,
+        obj: &ExId,
+        index: usize,
+        clock: Option<Clock>,
+    ) -> Result<MarkSet, AutomergeError> {
+        let obj = self.exid_to_obj(obj)?;
+        if obj.typ != ObjType::Text {
+            return Ok(MarkSet::default());
+        }
+        if clock.is_none() {
+            let fast = (self.ops.text_marks_at_fast(&obj.id, index))
+                .map(|marks| marks.as_ref().clone())
+                .unwrap_or_default();
+            #[cfg(feature = "slow_path_assertions")]
+            assert_eq!(
+                fast,
+                self.text_marks_at_slow(&obj, index, None),
+                "indexed marks at {index} != walked marks"
+            );
+            return Ok(fast);
+        }
+        Ok(self.text_marks_at_slow(&obj, index, clock))
+    }
+
+    /// [`Automerge::text_marks_at`] by walking the text's ops, for a past
+    /// clock and to check the indexed read.
+    fn text_marks_at_slow(
+        &self,
+        obj: &crate::types::ObjMeta,
+        index: usize,
+        clock: Option<Clock>,
+    ) -> MarkSet {
+        let encoding = self.text_encoding();
+        let mut ops = self.ops().top_ops(&obj.id, clock).marks();
+        let mut at = 0;
+        while let Some(op) = ops.next() {
+            at += op.width(SequenceType::Text, encoding);
+            if index < at {
+                return (ops.get_marks())
+                    .map(|marks| marks.as_ref().clone().without_unmarks())
+                    .filter(|marks| !marks.is_empty())
+                    .unwrap_or_default();
+            }
+        }
+        MarkSet::default()
+    }
+
     fn calculate_marks_slow(
         &self,
         obj: &crate::types::ObjMeta,
