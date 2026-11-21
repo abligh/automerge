@@ -1136,6 +1136,23 @@ impl OpSet {
         SkipIter::new(iter, top)
     }
 
+    /// The marks on the character at `index` of the text `obj`, `index`
+    /// counted in the text's encoding as [`crate::Automerge::splice_text`]
+    /// counts it: the marks begun and not ended in the ops before it,
+    /// from the text and mark indexes, without walking those ops.
+    /// [`None`] past the text's end, or where no mark holds once unmarks
+    /// are taken out (galatea issue 14404).
+    pub(crate) fn text_marks_at_fast(&self, obj: &ObjId, index: usize) -> Option<Arc<MarkSet>> {
+        if !self.cols.index.mark.has_any_marks() {
+            return None;
+        }
+        let range = self.scope_to_obj(obj);
+        let mut widths = self.cols.index.text.iter_range(range);
+        let seek = widths.advance_prefix(index as u64)?;
+        let state = self.cols.index.mark.rich_text_at(seek.pos, None);
+        MarkSet::from_query_state(&state)
+    }
+
     pub(crate) fn calculate_marks_fast(&self, obj: &ObjId) -> Vec<crate::marks::Mark> {
         use super::op_set::mark_index::MarkIdx;
         use crate::marks::MarkAccumulator;

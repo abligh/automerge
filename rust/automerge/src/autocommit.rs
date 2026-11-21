@@ -482,6 +482,19 @@ impl AutoCommit {
         self.doc.get_authors()
     }
 
+    /// [`Automerge::text_marks_at`], at the heads this document is
+    /// isolated to, if any: the marks on the character at `index` of the
+    /// text `obj`, `index` counted as [`Self::splice_text`] counts it
+    /// (galatea issue 14404).
+    pub fn text_marks_at<O: AsRef<ExId>>(
+        &self,
+        obj: O,
+        index: usize,
+    ) -> Result<MarkSet, AutomergeError> {
+        self.doc
+            .text_marks_at_for(obj.as_ref(), index, self.get_scope(None))
+    }
+
     pub fn isolate(&mut self, heads: &[ChangeHash]) {
         self.ensure_transaction_closed();
         self.patch_to(heads);
